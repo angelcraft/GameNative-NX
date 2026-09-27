@@ -165,7 +165,7 @@ bool init_solder() {
     int compat_count = 0;
 
     const solder_export_t* compat_exports =
-        android_compat_exports(
+        compat_exports(
             &compat_count
         );
 
