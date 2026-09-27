@@ -1,5 +1,6 @@
 #include <switch.h>
 #include <solder.h>
+#include "android_compat.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -165,7 +166,7 @@ bool init_solder() {
     int compat_count = 0;
 
     const solder_export_t* compat_table =
-        compat_exports(
+        android_compat_exports(
             &compat_count
         );
 
