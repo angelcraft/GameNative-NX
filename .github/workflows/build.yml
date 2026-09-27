@@ -17,19 +17,24 @@ jobs:
     steps:
       - name: Checkout GameNative NX
         uses: actions/checkout@v4
-
       - name: Show toolchain
         shell: bash
         run: |
           set -euo pipefail
-          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+
           echo "DEVKITPRO=$DEVKITPRO"
           echo "devkitA64=$DEVKITPRO/devkitA64"
+
           test -d "$DEVKITPRO/devkitA64"
           test -f "$DEVKITPRO/libnx/switch_rules"
-          command -v make
-          command -v aarch64-none-elf-g++
+          test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++"
 
+          echo "make:"
+          make --version | head -1
+
+          echo "compiler:"
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++" --version | head -1
+      
       - name: Fetch libsolder
         shell: bash
         run: |
