@@ -433,6 +433,7 @@ void probe_winlator(std::string& result) {
         solder_get_text_addr(handle);
 
     result += "ELF LOAD OK\n";
+
     result +=
         "base: " +
         hex_addr(base) +
@@ -443,79 +444,8 @@ void probe_winlator(std::string& result) {
         hex_addr(text) +
         "\n\n";
 
-    // ------------------------------------------------------------
-    // SYMBOL RESOLUTION TEST
-    // ------------------------------------------------------------
-
-    struct SymbolTest {
-        const char* name;
-        const char* provider;
-    };
-
-    const SymbolTest tests[] = {
-        { "malloc",              "libc.so" },
-        { "free",                "libc.so" },
-        { "dlopen",              "libdl.so" },
-        { "eglGetDisplay",       "libEGL.so" },
-        { "glGetString",         "libGLESv2.so" },
-        { "vkGetInstanceProcAddr","libvulkan.so" },
-        { "__android_log_print", "liblog.so" },
-        { "ANativeWindow_lock",  "libnativewindow.so" }
-    };
-
-    result +=
-        "SYMBOL TESTS:\n";
-
-    for (const SymbolTest& test : tests) {
-        void* symbol =
-            solder_dlsym(
-                handle,
-                test.name
-            );
-
-        const char* sym_err =
-            solder_dlerror();
-
-        result += "  ";
-
-        result += test.provider;
-        result += " : ";
-        result += test.name;
-        result += " = ";
-
-        if (symbol && !sym_err) {
-            result += "FOUND @ ";
-            result += hex_addr(symbol);
-        }
-        else {
-            result += "MISSING";
-
-            if (sym_err) {
-                result +=
-                    " (";
-
-                result += sym_err;
-                result += ")";
-            }
-        }
-
-        result += "\n";
-    }
-
-    append_log(
-        "libwinlator.so symbol resolution test:"
-    );
-
-    append_log(
-        result.c_str()
-    );
-
-    // ------------------------------------------------------------
-    // ELF DEPENDENCIES
-    // ------------------------------------------------------------
-
-    result += "\n";
-
+    // Read DT_NEEDED directly from the ELF file.
+    // This does NOT ask libsolder to resolve anything.
     std::string needed;
 
     const bool needed_ok =
