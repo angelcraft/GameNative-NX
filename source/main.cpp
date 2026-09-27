@@ -1,6 +1,5 @@
 #include <switch.h>
 #include <solder.h>
-#include "android_compat.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -88,15 +87,9 @@ std::string hex_addr(void* ptr) {
 
     return std::string(buffer);
 }
-bool has_available_export(
-    const std::string& name
-) {
-    for (int i = 0;
-         i < solder_num_default_exports;
-         ++i) {
-
-        const solder_export_t& exp =
-            solder_default_exports[i];
+bool has_default_export(const std::string& name) {
+    for (int i = 0; i < solder_num_default_exports; ++i) {
+        const solder_export_t& exp = solder_default_exports[i];
 
         if (!exp.name)
             continue;
@@ -105,7 +98,7 @@ bool has_available_export(
             return true;
     }
 
-    return android_compat_has_export(name);
+    return false;
 }
 
 void draw_header() {
@@ -132,51 +125,17 @@ bool init_solder() {
         return false;
     }
 
-int compat_count = 0;
+    if (solder_set_main_exports(
+            solder_default_exports,
+            solder_num_default_exports) != 0) {
 
-const solder_export_t* compat_exports =
-    android_compat_exports(&compat_count);
+        append_log(
+            "libsolder: failed to install default exports"
+        );
 
-const int total_exports =
-    solder_num_default_exports +
-    compat_count;
-
-// Keep the combined table alive for the lifetime of the loader.
-static solder_export_t* combined_exports = nullptr;
-
-if (!combined_exports) {
-    combined_exports =
-        new solder_export_t[total_exports];
-
-    for (int i = 0;
-         i < solder_num_default_exports;
-         ++i) {
-
-        combined_exports[i] =
-            solder_default_exports[i];
+        solder_quit();
+        return false;
     }
-
-    for (int i = 0;
-         i < compat_count;
-         ++i) {
-
-        combined_exports[
-            solder_num_default_exports + i
-        ] = compat_exports[i];
-    }
-}
-
-if (solder_set_main_exports(
-        combined_exports,
-        total_exports) != 0) {
-
-    append_log(
-        "libsolder: failed to install combined exports"
-    );
-
-    solder_quit();
-    return false;
-}
 
     if (solder_add_search_path(kNativeDir) != 0) {
         append_log(
@@ -1056,7 +1015,7 @@ bool inspect_undefined_symbols(
         else if (bind == STB_WEAK)
             bind_name = "WEAK";
 const bool provided =
-    has_available_export(name);
+    has_default_export(name);
 
 std::string line =
     "  [" +
@@ -1253,7 +1212,77 @@ void probe_winlator(std::string& result) {
         "ELF load succeeded (lazy/no-autoload)"
     );
 
-    // Return to the previously stable state.
+    // ------------------------------------------------------------
+    // CONTROLLED REAL RELOCATION TEST
+    // ------------------------------------------------------------
+    //
+    // solder_dlsym() on a lazy module forces libsolder to relocate the
+    // object and run its initialization code. We deliberately do NOT
+    // call the returned function. The exported symbol below is a real
+    // function from libwinlator.so and is only used as the trigger.
+    //
+    append_log(
+        "libwinlator.so relocation test: "
+        "calling solder_dlsym(createMemoryFd)"
+    );
+
+    result +=
+        "\nRELOCATION TEST: createMemoryFd\n";
+
+    void* resolved =
+        solder_dlsym(
+            handle,
+            "createMemoryFd"
+        );
+
+    const char* dlsym_err =
+        solder_dlerror();
+
+    if (resolved) {
+        const std::string resolved_text =
+            hex_addr(resolved);
+
+        result +=
+            "dlsym: SUCCESS\n";
+
+        result +=
+            "address: " +
+            resolved_text +
+            "\n";
+
+        append_logf(
+            "libwinlator.so relocation test: "
+            "SUCCESS, createMemoryFd=%s",
+            resolved_text.c_str()
+        );
+
+        // Keep the relocated module alive for this diagnostic run.
+        // We intentionally do not dlclose() it immediately, so a
+        // successful relocation is not mixed with destructor/fini code.
+        return;
+    }
+
+    result +=
+        "dlsym: FAILED\n";
+
+    result +=
+        "error: ";
+
+    result +=
+        dlsym_err
+            ? dlsym_err
+            : "(no error text)";
+
+    result += "\n";
+
+    append_logf(
+        "libwinlator.so relocation test: FAILED: %s",
+        dlsym_err
+            ? dlsym_err
+            : "(no error text)"
+    );
+
+    // Return to the previously stable state after a clean failure.
     solder_dlclose(handle);
 
     const char* close_err =
