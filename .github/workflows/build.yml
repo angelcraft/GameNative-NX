@@ -2,38 +2,62 @@ name: Build GameNative NX
 
 on:
   push:
-    branches:
-      - main
+    branches: ["main"]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     container:
       image: devkitpro/devkita64:latest
-
     steps:
-      - name: Checkout
+      - name: Checkout GameNative NX
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Show toolchain
+        shell: bash
         run: |
-          pacman -S --noconfirm \
-            switch-mesa \
-            switch-libdrm_nouveau \
-            switch-sdl2
+          set -euo pipefail
+          echo "DEVKITPRO=$DEVKITPRO"
+          echo "DEVKITA64=$DEVKITA64"
+          command -v make
+          command -v aarch64-none-elf-g++
 
-      - name: Get libsolder
+      - name: Fetch libsolder
+        shell: bash
         run: |
+          set -euo pipefail
+          rm -rf third_party/libsolder
           git clone --depth 1 https://github.com/fgsfdsfgs/libsolder.git third_party/libsolder
 
-      - name: Build
-        run: make -j$(nproc)
+      - name: Check required Switch headers and libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$DEVKITPRO/libnx/include/switch.h"
+          test -f "$DEVKITPRO/libnx/switch_rules"
+          echo "libnx: OK"
+          if [ -n "${PORTLIBS:-}" ]; then echo "PORTLIBS=$PORTLIBS"; fi
 
-      - name: Upload NRO
+      - name: Build
+        shell: bash
+        run: make -j"$(nproc)"
+
+      - name: Package Switch files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/switch/gamenative_nx
+          cp gamenative_nx.nro gamenative_nx.nacp artifact/switch/gamenative_nx/
+          cp README.md THIRD_PARTY_NOTICES.md artifact/switch/gamenative_nx/
+
+      - name: Upload NRO artifact
         uses: actions/upload-artifact@v4
         with:
           name: gamenative-nx
-          path: |
-            *.nro
-            *.nacp
+          path: artifact/
+          if-no-files-found: error
