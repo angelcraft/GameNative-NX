@@ -2,11 +2,16 @@
 
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwchar>
 
 namespace {
 
@@ -33,9 +38,6 @@ constexpr int GN_EPOLL_CTL_DEL = 2;
 constexpr int GN_EPOLL_CTL_MOD = 3;
 
 // ABI-compatible with Android's AArch64 epoll_event.
-// Bionic defines:
-//   uint32_t events;
-//   epoll_data_t data;
 struct gn_epoll_event {
     uint32_t events;
 
@@ -161,6 +163,11 @@ uint32_t poll_to_epoll_events(
 
 } // namespace
 
+
+// ============================================================================
+// Basic POSIX compatibility
+// ============================================================================
+
 extern "C" int gn_android_socket(
     int domain,
     int type,
@@ -213,14 +220,247 @@ extern "C" int gn_android_ftruncate(
     return ::ftruncate(fd, length);
 }
 
-// -----------------------------------------------------------------------------
-// epoll compatibility layer
+
+// ============================================================================
+// New libc / POSIX compatibility functions
+// ============================================================================
+
+extern "C" ssize_t gn_android_read_chk(
+    int fd,
+    void* buf,
+    size_t count,
+    size_t /*buflen*/
+) {
+    return ::read(
+        fd,
+        buf,
+        count
+    );
+}
+
+extern "C" ssize_t gn_android_write_chk(
+    int fd,
+    const void* buf,
+    size_t count,
+    size_t /*buflen*/
+) {
+    return ::write(
+        fd,
+        buf,
+        count
+    );
+}
+
+extern "C" int gn_android_vsprintf_chk(
+    char* dst,
+    int /*flag*/,
+    size_t dst_len,
+    const char* fmt,
+    va_list ap
+) {
+    if (!dst || !fmt) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (dst_len == 0) {
+        errno = ERANGE;
+        return -1;
+    }
+
+    return std::vsnprintf(
+        dst,
+        dst_len,
+        fmt,
+        ap
+    );
+}
+
+extern "C" void* gn_android_mmap(
+    void* addr,
+    size_t length,
+    int prot,
+    int flags,
+    int fd,
+    off_t offset
+) {
+    return ::mmap(
+        addr,
+        length,
+        prot,
+        flags,
+        fd,
+        offset
+    );
+}
+
+extern "C" int gn_android_munmap(
+    void* addr,
+    size_t length
+) {
+    return ::munmap(
+        addr,
+        length
+    );
+}
+
+extern "C" char* gn_android_strdup(
+    const char* src
+) {
+    if (!src) {
+        errno = EINVAL;
+        return nullptr;
+    }
+
+    return ::strdup(src);
+}
+
+extern "C" void gn_android_qsort(
+    void* base,
+    size_t nmemb,
+    size_t size,
+    int (*compar)(
+        const void*,
+        const void*
+    )
+) {
+    ::qsort(
+        base,
+        nmemb,
+        size,
+        compar
+    );
+}
+
+extern "C" wchar_t* gn_android_fgetws(
+    wchar_t* ws,
+    int n,
+    FILE* stream
+) {
+    return ::fgetws(
+        ws,
+        n,
+        stream
+    );
+}
+
+extern "C" ssize_t gn_android_sendmsg(
+    int sockfd,
+    const struct msghdr* msg,
+    int flags
+) {
+    return ::sendmsg(
+        sockfd,
+        msg,
+        flags
+    );
+}
+
+extern "C" ssize_t gn_android_recvmsg(
+    int sockfd,
+    struct msghdr* msg,
+    int flags
+) {
+    return ::recvmsg(
+        sockfd,
+        msg,
+        flags
+    );
+}
+
+extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
+    struct msghdr* msg,
+    struct cmsghdr* cmsg
+) {
+    if (!msg)
+        return nullptr;
+
+    if (!cmsg) {
+        if (!msg->msg_control ||
+            msg->msg_controllen <
+                sizeof(struct cmsghdr)) {
+
+            return nullptr;
+        }
+
+        return reinterpret_cast<struct cmsghdr*>(
+            msg->msg_control
+        );
+    }
+
+    unsigned char* base =
+        static_cast<unsigned char*>(
+            msg->msg_control
+        );
+
+    unsigned char* end =
+        base +
+        msg->msg_controllen;
+
+    unsigned char* next =
+        reinterpret_cast<unsigned char*>(
+            cmsg
+        ) +
+        CMSG_ALIGN(cmsg->cmsg_len);
+
+    if (next +
+            sizeof(struct cmsghdr) >
+        end) {
+
+        return nullptr;
+    }
+
+    struct cmsghdr* next_hdr =
+        reinterpret_cast<struct cmsghdr*>(
+            next
+        );
+
+    if (next +
+            CMSG_ALIGN(
+                next_hdr->cmsg_len
+            ) >
+        end) {
+
+        return nullptr;
+    }
+
+    return next_hdr;
+}
+
+
+// ============================================================================
+// syscall compatibility
+// ============================================================================
 //
-// This is a first-pass implementation:
+// Linux syscall numbers do not map directly to Horizon.
+// We deliberately do NOT translate them blindly yet.
+//
+// Returning ENOSYS is safer until we know the exact syscall numbers that
+// libwinlator actually invokes.
+//
+// This export exists so that the dynamic symbol is present, but any call to
+// it currently reports "function not implemented".
+//
+
+extern "C" long gn_android_syscall(
+    long /*number*/,
+    ...
+) {
+    errno = ENOSYS;
+    return -1;
+}
+
+
+// ============================================================================
+// epoll compatibility layer
+// ============================================================================
+//
+// First-pass implementation:
+//
 //   epoll_ctl() stores the requested watches.
-//   epoll_wait() translates them to poll().
+//   epoll_wait() translates those watches into poll().
 //   EPOLLET / EPOLLONESHOT semantics are not implemented yet.
-// -----------------------------------------------------------------------------
+//
 
 extern "C" int gn_android_epoll_create(
     int size
@@ -230,15 +470,21 @@ extern "C" int gn_android_epoll_create(
         return -1;
     }
 
-    for (int i = 0; i < kMaxEpollInstances; ++i) {
+    for (int i = 0;
+         i < kMaxEpollInstances;
+         ++i) {
+
         if (g_epolls[i].used)
             continue;
 
-        // We need a real, unique file descriptor so the returned
-        // integer behaves like a normal fd as far as the process is
-        // concerned. The fd itself is NOT used for waiting.
+        // Use a real descriptor as a unique handle.
+        // The descriptor itself is not used for waiting.
         const int handle =
-            ::socket(AF_INET, SOCK_STREAM, 0);
+            ::socket(
+                AF_INET,
+                SOCK_STREAM,
+                0
+            );
 
         if (handle < 0)
             return -1;
@@ -307,7 +553,10 @@ extern "C" int gn_android_epoll_ctl(
         }
 
         EpollWatch* watch =
-            find_watch(ep, fd);
+            find_watch(
+                ep,
+                fd
+            );
 
         if (!watch) {
             errno = ENOENT;
@@ -319,15 +568,21 @@ extern "C" int gn_android_epoll_ctl(
                 event_ptr
             );
 
-        watch->events = src->events;
-        watch->user_event = *src;
+        watch->events =
+            src->events;
+
+        watch->user_event =
+            *src;
 
         return 0;
     }
 
     if (op == GN_EPOLL_CTL_DEL) {
         EpollWatch* watch =
-            find_watch(ep, fd);
+            find_watch(
+                ep,
+                fd
+            );
 
         if (!watch) {
             errno = ENOENT;
@@ -348,7 +603,9 @@ extern "C" int gn_android_epoll_wait(
     int maxevents,
     int timeout
 ) {
-    if (!events_ptr || maxevents <= 0) {
+    if (!events_ptr ||
+        maxevents <= 0) {
+
         errno = EINVAL;
         return -1;
     }
@@ -361,23 +618,37 @@ extern "C" int gn_android_epoll_wait(
         return -1;
     }
 
-    pollfd poll_fds[kMaxEpollWatches];
-    EpollWatch* watch_map[kMaxEpollWatches];
+    pollfd poll_fds[
+        kMaxEpollWatches
+    ];
+
+    EpollWatch* watch_map[
+        kMaxEpollWatches
+    ];
 
     int poll_count = 0;
 
-    for (int i = 0; i < kMaxEpollWatches; ++i) {
+    for (int i = 0;
+         i < kMaxEpollWatches;
+         ++i) {
+
         EpollWatch& watch =
             ep->watches[i];
 
         if (!watch.used)
             continue;
 
-        if (poll_count >= kMaxEpollWatches)
+        if (poll_count >=
+            kMaxEpollWatches) {
+
             break;
+        }
 
         poll_fds[poll_count] = {};
-        poll_fds[poll_count].fd = watch.fd;
+
+        poll_fds[poll_count].fd =
+            watch.fd;
+
         poll_fds[poll_count].events =
             epoll_to_poll_events(
                 watch.events
@@ -390,8 +661,6 @@ extern "C" int gn_android_epoll_wait(
     }
 
     if (poll_count == 0) {
-        // No descriptors are registered.
-        // Match epoll's timeout behavior for this first pass.
         return ::poll(
             nullptr,
             0,
@@ -402,7 +671,9 @@ extern "C" int gn_android_epoll_wait(
     const int ready =
         ::poll(
             poll_fds,
-            static_cast<nfds_t>(poll_count),
+            static_cast<nfds_t>(
+                poll_count
+            ),
             timeout
         );
 
@@ -435,8 +706,9 @@ extern "C" int gn_android_epoll_wait(
                 poll_fds[i].revents
             );
 
-        out_events[output_count] =
-            out;
+        out_events[
+            output_count
+        ] = out;
 
         ++output_count;
     }
@@ -444,7 +716,14 @@ extern "C" int gn_android_epoll_wait(
     return output_count;
 }
 
+
+// ============================================================================
+// Export table
+// ============================================================================
+
 static const solder_export_t kAndroidCompatExports[] = {
+
+    // Existing socket / filesystem compatibility.
     SOLDER_EXPORT(
         "socket",
         (void*)&gn_android_socket
@@ -480,6 +759,7 @@ static const solder_export_t kAndroidCompatExports[] = {
         (void*)&gn_android_ftruncate
     ),
 
+    // epoll.
     SOLDER_EXPORT(
         "epoll_create",
         (void*)&gn_android_epoll_create
@@ -494,7 +774,77 @@ static const solder_export_t kAndroidCompatExports[] = {
         "epoll_wait",
         (void*)&gn_android_epoll_wait
     ),
+
+    // Checked libc functions.
+    SOLDER_EXPORT(
+        "__read_chk",
+        (void*)&gn_android_read_chk
+    ),
+
+    SOLDER_EXPORT(
+        "__write_chk",
+        (void*)&gn_android_write_chk
+    ),
+
+    SOLDER_EXPORT(
+        "__vsprintf_chk",
+        (void*)&gn_android_vsprintf_chk
+    ),
+
+    // Memory.
+    SOLDER_EXPORT(
+        "mmap",
+        (void*)&gn_android_mmap
+    ),
+
+    SOLDER_EXPORT(
+        "munmap",
+        (void*)&gn_android_munmap
+    ),
+
+    // libc helpers.
+    SOLDER_EXPORT(
+        "strdup",
+        (void*)&gn_android_strdup
+    ),
+
+    SOLDER_EXPORT(
+        "qsort",
+        (void*)&gn_android_qsort
+    ),
+
+    SOLDER_EXPORT(
+        "fgetws",
+        (void*)&gn_android_fgetws
+    ),
+
+    // Socket message APIs.
+    SOLDER_EXPORT(
+        "sendmsg",
+        (void*)&gn_android_sendmsg
+    ),
+
+    SOLDER_EXPORT(
+        "recvmsg",
+        (void*)&gn_android_recvmsg
+    ),
+
+    SOLDER_EXPORT(
+        "__cmsg_nxthdr",
+        (void*)&gn_android_cmsg_nxthdr
+    ),
+
+    // Linux syscall entry point.
+    SOLDER_EXPORT(
+        "syscall",
+        (void*)&gn_android_syscall
+    ),
 };
+
+
+// ============================================================================
+// Public compatibility API
+// ============================================================================
 
 const solder_export_t* android_compat_exports(
     int* count
@@ -516,9 +866,14 @@ bool android_compat_has_export(
     int count = 0;
 
     const solder_export_t* exports =
-        android_compat_exports(&count);
+        android_compat_exports(
+            &count
+        );
 
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0;
+         i < count;
+         ++i) {
+
         if (!exports[i].name)
             continue;
 
