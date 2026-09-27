@@ -164,7 +164,7 @@ bool init_solder() {
 
     int compat_count = 0;
 
-    const solder_export_t* compat_exports =
+    const solder_export_t* compat_table =
         compat_exports(
             &compat_count
         );
@@ -175,7 +175,7 @@ bool init_solder() {
          ++i) {
 
         const solder_export_t& exp =
-            compat_exports[i];
+            compat_table[i];
 
         if (!exp.name || !exp.addr_rx)
             continue;
