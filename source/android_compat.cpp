@@ -2,7 +2,6 @@
 
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <cerrno>
