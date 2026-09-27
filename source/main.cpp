@@ -87,6 +87,19 @@ std::string hex_addr(void* ptr) {
 
     return std::string(buffer);
 }
+bool has_default_export(const std::string& name) {
+    for (int i = 0; i < solder_num_default_exports; ++i) {
+        const solder_export_t& exp = solder_default_exports[i];
+
+        if (!exp.name)
+            continue;
+
+        if (name == exp.name)
+            return true;
+    }
+
+    return false;
+}
 
 void draw_header() {
     std::printf("\x1b[1;1H\x1b[2J");
@@ -1001,13 +1014,22 @@ bool inspect_undefined_symbols(
             bind_name = "GLOBAL";
         else if (bind == STB_WEAK)
             bind_name = "WEAK";
+const bool provided =
+    has_default_export(name);
 
-        std::string line =
-            "  [" +
-            std::string(bind_name) +
-            "] " +
-            name +
-            "\n";
+std::string line =
+    "  [" +
+    std::string(bind_name) +
+    "] " +
+    name +
+    "    ";
+
+if (provided)
+    line += "DEFAULT";
+else
+    line += "MISSING";
+
+line += "\n";
 
         full_result += line;
 
