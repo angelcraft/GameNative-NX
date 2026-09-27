@@ -122,6 +122,9 @@ int main(int /*argc*/, char** /*argv*/) {
 
     const bool solder_ok = init_solder();
 
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&pad);
     bool probed = false;
     while (appletMainLoop()) {
         draw_header();
@@ -148,8 +151,9 @@ int main(int /*argc*/, char** /*argv*/) {
         }
 
         consoleUpdate(nullptr);
-        hidScanInput();
-        const u64 buttons = hidKeysDown(CONTROLLER_P1_AUTO);
+
+        padUpdate(&pad);
+        const u64 buttons = padGetButtonsDown(&pad);
 
         if ((buttons & HidNpadButton_Plus) != 0) break;
         if ((buttons & HidNpadButton_A) != 0 && solder_ok) {
