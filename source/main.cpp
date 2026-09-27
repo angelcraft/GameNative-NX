@@ -87,18 +87,28 @@ std::string hex_addr(void* ptr) {
 
     return std::string(buffer);
 }
-bool has_default_export(const std::string& name) {
-    for (int i = 0; i < solder_num_default_exports; ++i) {
-        const solder_export_t& exp = solder_default_exports[i];
+constexpr int kMaxMainExports = 512;
 
-        if (!exp.name)
+static solder_export_t g_main_exports[kMaxMainExports];
+static int g_main_export_count = 0;
+
+bool main_export_exists(const char* name) {
+    if (!name)
+        return false;
+
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (!g_main_exports[i].name)
             continue;
 
-        if (name == exp.name)
+        if (std::strcmp(name, g_main_exports[i].name) == 0)
             return true;
     }
 
     return false;
+}
+
+bool has_available_export(const std::string& name) {
+    return main_export_exists(name.c_str());
 }
 
 void draw_header() {
@@ -125,12 +135,75 @@ bool init_solder() {
         return false;
     }
 
+    // Build ONE export table containing:
+    //   1) libsolder's normal Switch/libc exports
+    //   2) our Android/POSIX compatibility exports
+    //
+    // solder_set_main_exports() turns this table into the main module's
+    // dynamic symbol table. Relocations in loaded DSOs resolve through this
+    // global table.
+    g_main_export_count = 0;
+
+    for (int i = 0;
+         i < solder_num_default_exports &&
+         g_main_export_count < kMaxMainExports;
+         ++i) {
+
+        const solder_export_t& exp =
+            solder_default_exports[i];
+
+        if (!exp.name || !exp.addr_rx)
+            continue;
+
+        if (main_export_exists(exp.name))
+            continue;
+
+        g_main_exports[g_main_export_count++] =
+            exp;
+    }
+
+    int compat_count = 0;
+
+    const solder_export_t* compat_exports =
+        android_compat_exports(
+            &compat_count
+        );
+
+    for (int i = 0;
+         i < compat_count &&
+         g_main_export_count < kMaxMainExports;
+         ++i) {
+
+        const solder_export_t& exp =
+            compat_exports[i];
+
+        if (!exp.name || !exp.addr_rx)
+            continue;
+
+        // Keep the first definition if a compatibility name happens to
+        // overlap an existing Switch/default export.
+        if (main_export_exists(exp.name))
+            continue;
+
+        g_main_exports[g_main_export_count++] =
+            exp;
+    }
+
+    if (g_main_export_count <= 0) {
+        append_log(
+            "libsolder: combined export table is empty"
+        );
+
+        solder_quit();
+        return false;
+    }
+
     if (solder_set_main_exports(
-            solder_default_exports,
-            solder_num_default_exports) != 0) {
+            g_main_exports,
+            g_main_export_count) != 0) {
 
         append_log(
-            "libsolder: failed to install default exports"
+            "libsolder: failed to install combined main exports"
         );
 
         solder_quit();
@@ -145,6 +218,15 @@ bool init_solder() {
         solder_quit();
         return false;
     }
+
+    char export_log[96];
+    std::snprintf(
+        export_log,
+        sizeof(export_log),
+        "libsolder: combined main exports installed: %d",
+        g_main_export_count
+    );
+    append_log(export_log);
 
     append_log("libsolder: initialized");
     return true;
@@ -1015,7 +1097,7 @@ bool inspect_undefined_symbols(
         else if (bind == STB_WEAK)
             bind_name = "WEAK";
 const bool provided =
-    has_default_export(name);
+    has_available_export(name);
 
 std::string line =
     "  [" +
