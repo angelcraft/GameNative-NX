@@ -393,10 +393,7 @@ bool inspect_needed(
 void probe_winlator(std::string& result) {
     result.clear();
 
-    std::printf(
-        "\nProbing libwinlator.so...\n"
-    );
-
+    std::printf("\nProbing libwinlator.so...\n");
     consoleUpdate(nullptr);
 
     const int flags =
@@ -413,9 +410,7 @@ void probe_winlator(std::string& result) {
         solder_dlerror();
 
     if (!handle) {
-        result =
-            "LOAD FAILED\n";
-
+        result = "LOAD FAILED\n";
         result +=
             err
                 ? err
@@ -437,9 +432,7 @@ void probe_winlator(std::string& result) {
     void* text =
         solder_get_text_addr(handle);
 
-    result +=
-        "ELF LOAD OK\n";
-
+    result += "ELF LOAD OK\n";
     result +=
         "base: " +
         hex_addr(base) +
@@ -449,6 +442,79 @@ void probe_winlator(std::string& result) {
         "text: " +
         hex_addr(text) +
         "\n\n";
+
+    // ------------------------------------------------------------
+    // SYMBOL RESOLUTION TEST
+    // ------------------------------------------------------------
+
+    struct SymbolTest {
+        const char* name;
+        const char* provider;
+    };
+
+    const SymbolTest tests[] = {
+        { "malloc",              "libc.so" },
+        { "free",                "libc.so" },
+        { "dlopen",              "libdl.so" },
+        { "eglGetDisplay",       "libEGL.so" },
+        { "glGetString",         "libGLESv2.so" },
+        { "vkGetInstanceProcAddr","libvulkan.so" },
+        { "__android_log_print", "liblog.so" },
+        { "ANativeWindow_lock",  "libnativewindow.so" }
+    };
+
+    result +=
+        "SYMBOL TESTS:\n";
+
+    for (const SymbolTest& test : tests) {
+        void* symbol =
+            solder_dlsym(
+                handle,
+                test.name
+            );
+
+        const char* sym_err =
+            solder_dlerror();
+
+        result += "  ";
+
+        result += test.provider;
+        result += " : ";
+        result += test.name;
+        result += " = ";
+
+        if (symbol && !sym_err) {
+            result += "FOUND @ ";
+            result += hex_addr(symbol);
+        }
+        else {
+            result += "MISSING";
+
+            if (sym_err) {
+                result +=
+                    " (";
+
+                result += sym_err;
+                result += ")";
+            }
+        }
+
+        result += "\n";
+    }
+
+    append_log(
+        "libwinlator.so symbol resolution test:"
+    );
+
+    append_log(
+        result.c_str()
+    );
+
+    // ------------------------------------------------------------
+    // ELF DEPENDENCIES
+    // ------------------------------------------------------------
+
+    result += "\n";
 
     std::string needed;
 
@@ -492,9 +558,7 @@ void probe_winlator(std::string& result) {
         solder_dlerror();
 
     if (close_err) {
-        result +=
-            "\nclose: ";
-
+        result += "\nclose: ";
         result += close_err;
 
         append_logf(
@@ -503,7 +567,6 @@ void probe_winlator(std::string& result) {
         );
     }
 }
-
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
