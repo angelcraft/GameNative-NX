@@ -349,21 +349,15 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
     struct msghdr* msg,
     struct cmsghdr* cmsg
 ) {
-    if (!msg)
+    if (!msg || !msg->msg_control)
         return nullptr;
 
-    if (!cmsg) {
-        if (!msg->msg_control ||
-            msg->msg_controllen <
-                sizeof(struct cmsghdr)) {
+    const size_t alignment = sizeof(size_t);
 
-            return nullptr;
-        }
-
-        return reinterpret_cast<struct cmsghdr*>(
-            msg->msg_control
-        );
-    }
+    auto align_len = [alignment](size_t len) -> size_t {
+        return (len + alignment - 1) &
+               ~(alignment - 1);
+    };
 
     unsigned char* base =
         static_cast<unsigned char*>(
@@ -371,32 +365,41 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
         );
 
     unsigned char* end =
-        base +
-        msg->msg_controllen;
+        base + msg->msg_controllen;
+
+    if (!cmsg) {
+        if (base + sizeof(struct cmsghdr) > end)
+            return nullptr;
+
+        return reinterpret_cast<struct cmsghdr*>(base);
+    }
+
+    unsigned char* current =
+        reinterpret_cast<unsigned char*>(cmsg);
+
+    if (current < base ||
+        current + sizeof(struct cmsghdr) > end) {
+
+        return nullptr;
+    }
+
+    if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+        return nullptr;
 
     unsigned char* next =
-        reinterpret_cast<unsigned char*>(
-            cmsg
-        ) +
-GN_CMSG_ALIGN(cmsg->cmsg_len)
-    if (next +
-            sizeof(struct cmsghdr) >
-        end) {
+        current + align_len(cmsg->cmsg_len);
 
+    if (next + sizeof(struct cmsghdr) > end)
         return nullptr;
-    }
 
     struct cmsghdr* next_hdr =
-        reinterpret_cast<struct cmsghdr*>(
-            next
-        );
+        reinterpret_cast<struct cmsghdr*>(next);
 
-    if (next +
-           GN_CMSG_ALIGN(next_hdr->cmsg_len) >
-        end) {
-
+    if (next_hdr->cmsg_len < sizeof(struct cmsghdr))
         return nullptr;
-    }
+
+    if (next + next_hdr->cmsg_len > end)
+        return nullptr;
 
     return next_hdr;
 }
