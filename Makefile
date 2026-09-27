@@ -1,5 +1,5 @@
 # GameNative NX - Nintendo Switch homebrew bootstrap + libsolder probe
-# Requires devkitPro/devkitA64. libsolder is tracked as a git submodule.
+# Requires devkitPro/devkitA64. libsolder is fetched by GitHub Actions for CI.
 
 .SUFFIXES:
 ifeq ($(strip $(DEVKITPRO)),)
