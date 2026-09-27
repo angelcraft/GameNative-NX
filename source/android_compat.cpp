@@ -406,6 +406,23 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 
 
 // ============================================================================
+// Resolution-only placeholders for remaining Android/system imports
+// ============================================================================
+//
+// IMPORTANT:
+// These functions only make the ELF imports resolve during the static
+// compatibility pass. They are NOT real implementations of the Android,
+// EGL/GLES, Vulkan, or C++ runtime APIs.
+//
+// Do not call them yet. A later step will replace these with real shims.
+//
+extern "C" uintptr_t gn_android_unimplemented(...) {
+    errno = ENOSYS;
+    return 0;
+}
+
+
+// ============================================================================
 // syscall compatibility
 // ============================================================================
 //
@@ -805,6 +822,40 @@ static const solder_export_t kAndroidCompatExports[] = {
         "syscall",
         (void*)&gn_android_syscall
     ),
+
+    // ------------------------------------------------------------------------
+    // Resolution-only Android / C++ runtime / graphics placeholders.
+    // ------------------------------------------------------------------------
+    SOLDER_EXPORT("__cxa_finalize", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("__cxa_atexit", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("__register_atfork", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("__stack_chk_fail", (void*)&gn_android_unimplemented),
+
+    SOLDER_EXPORT("AndroidBitmap_getInfo", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AndroidBitmap_lockPixels", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AndroidBitmap_unlockPixels", (void*)&gn_android_unimplemented),
+
+    SOLDER_EXPORT("AHardwareBuffer_getNativeHandle", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AHardwareBuffer_acquire", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AHardwareBuffer_allocate", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AHardwareBuffer_describe", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AHardwareBuffer_unlock", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AHardwareBuffer_release", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("AHardwareBuffer_lock", (void*)&gn_android_unimplemented),
+
+    SOLDER_EXPORT("ASharedMemory_create", (void*)&gn_android_unimplemented),
+
+    SOLDER_EXPORT("eglGetNativeClientBufferANDROID", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("eglGetDisplay", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("eglCreateImageKHR", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("eglDestroyImageKHR", (void*)&gn_android_unimplemented),
+
+    SOLDER_EXPORT("glBindTexture", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("glEGLImageTargetTexture2DOES", (void*)&gn_android_unimplemented),
+
+    SOLDER_EXPORT("vkCreateInstance", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("vkEnumeratePhysicalDevices", (void*)&gn_android_unimplemented),
+    SOLDER_EXPORT("vkEnumerateDeviceExtensionProperties", (void*)&gn_android_unimplemented),
 };
 
 
