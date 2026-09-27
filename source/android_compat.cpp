@@ -12,6 +12,11 @@
 #include <cstring>
 #include <cwchar>
 
+#ifndef GN_CMSG_ALIGN
+#define GN_CMSG_ALIGN(len) \
+    (((len) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#endif
+
 namespace {
 
 constexpr int kMaxEpollInstances = 8;
@@ -275,15 +280,6 @@ extern "C" int gn_android_vsprintf_chk(
     );
 }
 
-extern "C" int gn_android_munmap(
-    void* addr,
-    size_t length
-) {
-    return ::munmap(
-        addr,
-        length
-    );
-}
 
 extern "C" char* gn_android_strdup(
     const char* src
@@ -382,8 +378,7 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
         reinterpret_cast<unsigned char*>(
             cmsg
         ) +
-        CMSG_ALIGN(cmsg->cmsg_len);
-
+GN_CMSG_ALIGN(cmsg->cmsg_len)
     if (next +
             sizeof(struct cmsghdr) >
         end) {
@@ -397,9 +392,7 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
         );
 
     if (next +
-            CMSG_ALIGN(
-                next_hdr->cmsg_len
-            ) >
+           GN_CMSG_ALIGN(next_hdr->cmsg_len) >
         end) {
 
         return nullptr;
