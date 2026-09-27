@@ -83,36 +83,52 @@ bool init_solder() {
     return true;
 }
 
-void probe_winlator() {
-    std::printf("\n[ A ] Probing libwinlator.so with libsolder...\n");
+void probe_winlator(std::string& result) {
+    result.clear();
 
-    // LAZY is intentional: we want to prove that the ELF loader can ingest
-    // the Android AArch64 shared object without running its Android-dependent
-    // initializers yet. We do not pretend this makes it executable on Switch.
-    void* handle = solder_dlopen("libwinlator.so", SOLDER_LAZY);
+    std::printf("\nProbing libwinlator.so...\n");
+    consoleUpdate(nullptr);
+
+    // LAZY + NO_AUTOLOAD:
+    // Load only this ELF. Do not recursively load its Android dependencies yet.
+    const int flags = SOLDER_LAZY | SOLDER_NO_AUTOLOAD;
+
+    void* handle = solder_dlopen("libwinlator.so", flags);
     const char* err = solder_dlerror();
 
     if (!handle) {
-        std::printf("      LOAD FAILED\n");
-        std::printf("      %s\n", err ? err : "(no error text)");
-        append_logf("libwinlator.so probe failed: %s", err ? err : "(no error text)");
+        result = "LOAD FAILED\n";
+        result += err ? err : "(no error text)";
+        append_logf("libwinlator.so probe failed: %s",
+                    err ? err : "(no error text)");
         return;
     }
 
     void* base = solder_get_base_addr(handle);
     void* text = solder_get_text_addr(handle);
 
-    std::printf("      ELF LOAD OK\n");
-    std::printf("      base: %p\n", base);
-    std::printf("      text: %p\n", text);
-    append_log("libwinlator.so probe: ELF load succeeded (lazy mode)");
+    char buffer[256];
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "ELF LOAD OK\nbase: %p\ntext: %p",
+        base,
+        text
+    );
+
+    result = buffer;
+
+    append_log("libwinlator.so probe: ELF load succeeded (lazy/no-autoload)");
 
     solder_dlclose(handle);
     const char* close_err = solder_dlerror();
-    if (close_err) append_logf("libwinlator.so close: %s", close_err);
-}
-}
 
+    if (close_err) {
+        result += "\nclose: ";
+        result += close_err;
+        append_logf("libwinlator.so close: %s", close_err);
+    }
+}
 int main(int /*argc*/, char** /*argv*/) {
     consoleInit(nullptr);
     socketInitializeDefault();
@@ -126,6 +142,7 @@ int main(int /*argc*/, char** /*argv*/) {
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
     bool probed = false;
+std::string probe_result;
     while (appletMainLoop()) {
         draw_header();
 
@@ -149,18 +166,23 @@ int main(int /*argc*/, char** /*argv*/) {
             std::printf("\nPut libwinlator.so in:\n%s\n", kNativeDir);
             std::printf("then press A.\n");
         }
-
+        
+        if (probed) {
+            std::printf("\n============================================================\n");
+            std::printf("                PROBE RESULT\n");
+            std::printf("============================================================\n");
+            std::printf("%s\n", probe_result.c_str());
+        }
         consoleUpdate(nullptr);
 
         padUpdate(&pad);
         const u64 buttons = padGetButtonsDown(&pad);
 
         if ((buttons & HidNpadButton_Plus) != 0) break;
-        if ((buttons & HidNpadButton_A) != 0 && solder_ok) {
-            probe_winlator();
-            probed = true;
-            svcSleepThread(500'000'000ULL);
-        }
+        if ((buttons & HidNpadButton_A) != 0 && solder_ok && !probed) {
+               probe_winlator(probe_result);
+               probed = true;
+           }
 
         svcSleepThread(16'000'000ULL);
     }
