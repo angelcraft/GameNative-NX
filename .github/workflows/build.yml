@@ -1,0 +1,39 @@
+name: Build GameNative NX
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pacman -S --noconfirm \
+            switch-mesa \
+            switch-libdrm_nouveau \
+            switch-sdl2
+
+      - name: Get libsolder
+        run: |
+          git clone --depth 1 https://github.com/fgsfdsfgs/libsolder.git third_party/libsolder
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Upload NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamenative-nx
+          path: |
+            *.nro
+            *.nacp
