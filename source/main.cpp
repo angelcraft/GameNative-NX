@@ -1,5 +1,6 @@
 #include <switch.h>
 #include <solder.h>
+#include "android_compat.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -87,9 +88,15 @@ std::string hex_addr(void* ptr) {
 
     return std::string(buffer);
 }
-bool has_default_export(const std::string& name) {
-    for (int i = 0; i < solder_num_default_exports; ++i) {
-        const solder_export_t& exp = solder_default_exports[i];
+bool has_available_export(
+    const std::string& name
+) {
+    for (int i = 0;
+         i < solder_num_default_exports;
+         ++i) {
+
+        const solder_export_t& exp =
+            solder_default_exports[i];
 
         if (!exp.name)
             continue;
@@ -98,7 +105,7 @@ bool has_default_export(const std::string& name) {
             return true;
     }
 
-    return false;
+    return android_compat_has_export(name);
 }
 
 void draw_header() {
@@ -125,17 +132,51 @@ bool init_solder() {
         return false;
     }
 
-    if (solder_set_main_exports(
-            solder_default_exports,
-            solder_num_default_exports) != 0) {
+int compat_count = 0;
 
-        append_log(
-            "libsolder: failed to install default exports"
-        );
+const solder_export_t* compat_exports =
+    android_compat_exports(&compat_count);
 
-        solder_quit();
-        return false;
+const int total_exports =
+    solder_num_default_exports +
+    compat_count;
+
+// Keep the combined table alive for the lifetime of the loader.
+static solder_export_t* combined_exports = nullptr;
+
+if (!combined_exports) {
+    combined_exports =
+        new solder_export_t[total_exports];
+
+    for (int i = 0;
+         i < solder_num_default_exports;
+         ++i) {
+
+        combined_exports[i] =
+            solder_default_exports[i];
     }
+
+    for (int i = 0;
+         i < compat_count;
+         ++i) {
+
+        combined_exports[
+            solder_num_default_exports + i
+        ] = compat_exports[i];
+    }
+}
+
+if (solder_set_main_exports(
+        combined_exports,
+        total_exports) != 0) {
+
+    append_log(
+        "libsolder: failed to install combined exports"
+    );
+
+    solder_quit();
+    return false;
+}
 
     if (solder_add_search_path(kNativeDir) != 0) {
         append_log(
@@ -1015,7 +1056,7 @@ bool inspect_undefined_symbols(
         else if (bind == STB_WEAK)
             bind_name = "WEAK";
 const bool provided =
-    has_default_export(name);
+    has_available_export(name);
 
 std::string line =
     "  [" +
