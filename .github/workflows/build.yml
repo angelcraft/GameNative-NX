@@ -30,7 +30,7 @@ jobs:
           test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++"
 
           echo "make:"
-          make --version | head -1
+          make --version
 
           echo "compiler:"
           "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++" --version | head -1
