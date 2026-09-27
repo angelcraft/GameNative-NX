@@ -1,0 +1,5 @@
+GameNative NX glue code is distributed under the GNU General Public License v3.0.
+
+This project does not distribute GameNative, Wine/Proton, FEX, Box64, DXVK,
+VKD3D, game binaries, APKs, or other third-party proprietary assets. Each
+third-party component retains its own license and attribution requirements.
