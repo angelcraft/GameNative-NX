@@ -22,8 +22,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
           echo "DEVKITPRO=$DEVKITPRO"
-          echo "DEVKITA64=$DEVKITA64"
+          echo "devkitA64=$DEVKITPRO/devkitA64"
+          test -d "$DEVKITPRO/devkitA64"
+          test -f "$DEVKITPRO/libnx/switch_rules"
           command -v make
           command -v aarch64-none-elf-g++
 
