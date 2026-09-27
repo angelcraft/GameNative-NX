@@ -275,24 +275,6 @@ extern "C" int gn_android_vsprintf_chk(
     );
 }
 
-extern "C" void* gn_android_mmap(
-    void* addr,
-    size_t length,
-    int prot,
-    int flags,
-    int fd,
-    off_t offset
-) {
-    return ::mmap(
-        addr,
-        length,
-        prot,
-        flags,
-        fd,
-        offset
-    );
-}
-
 extern "C" int gn_android_munmap(
     void* addr,
     size_t length
@@ -788,17 +770,6 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT(
         "__vsprintf_chk",
         (void*)&gn_android_vsprintf_chk
-    ),
-
-    // Memory.
-    SOLDER_EXPORT(
-        "mmap",
-        (void*)&gn_android_mmap
-    ),
-
-    SOLDER_EXPORT(
-        "munmap",
-        (void*)&gn_android_munmap
     ),
 
     // libc helpers.
