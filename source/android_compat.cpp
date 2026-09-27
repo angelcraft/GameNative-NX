@@ -406,6 +406,43 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 
 
 // ============================================================================
+// Additional resolution-only POSIX placeholders
+// ============================================================================
+//
+// These are deliberately NOT real Linux mmap/eventfd implementations yet.
+// They only make the ELF imports resolvable so we can move to the next
+// diagnostic stage without pulling in a missing <sys/mman.h> API.
+//
+extern "C" void* gn_android_mmap(
+    void* /*addr*/,
+    size_t /*length*/,
+    int /*prot*/,
+    int /*flags*/,
+    int /*fd*/,
+    int64_t /*offset*/
+) {
+    errno = ENOSYS;
+    return reinterpret_cast<void*>(-1);
+}
+
+extern "C" int gn_android_munmap(
+    void* /*addr*/,
+    size_t /*length*/
+) {
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int gn_android_eventfd(
+    unsigned int /*initval*/,
+    int /*flags*/
+) {
+    errno = ENOSYS;
+    return -1;
+}
+
+
+// ============================================================================
 // Resolution-only placeholders for remaining Android/system imports
 // ============================================================================
 //
@@ -856,6 +893,11 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("vkCreateInstance", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("vkEnumeratePhysicalDevices", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("vkEnumerateDeviceExtensionProperties", (void*)&gn_android_unimplemented),
+
+    // Additional resolution-only POSIX placeholders.
+    SOLDER_EXPORT("mmap", (void*)&gn_android_mmap),
+    SOLDER_EXPORT("munmap", (void*)&gn_android_munmap),
+    SOLDER_EXPORT("eventfd", (void*)&gn_android_eventfd),
 };
 
 
