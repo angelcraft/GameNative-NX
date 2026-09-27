@@ -13,7 +13,7 @@ constexpr const char* kNativeDir = "sdmc:/switch/gamenative_nx/native/arm64-v8a"
 constexpr const char* kRuntimeDir = "sdmc:/switch/gamenative_nx/runtime";
 constexpr const char* kGamesDir = "sdmc:/switch/gamenative_nx/games";
 constexpr const char* kLog = "sdmc:/switch/gamenative_nx/debug.log";
-
+}
 bool exists(const char* path) {
     struct stat st{};
     return stat(path, &st) == 0;
