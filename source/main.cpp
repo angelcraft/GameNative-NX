@@ -1,6 +1,4 @@
-ELF LOAD OK
-base: 0x...
-AA#include <switch.h>
+#include <switch.h>
 #include <solder.h>
 
 #include <cstdio>
@@ -12,12 +10,21 @@ AA#include <switch.h>
 #include <cstdint>
 
 namespace {
-constexpr const char* kRoot = "sdmc:/switch/gamenative_nx";
-constexpr const char* kNativeDir = "sdmc:/switch/gamenative_nx/native/arm64-v8a";
-constexpr const char* kRuntimeDir = "sdmc:/switch/gamenative_nx/runtime";
-constexpr const char* kGamesDir = "sdmc:/switch/gamenative_nx/games";
-constexpr const char* kLog = "sdmc:/switch/gamenative_nx/debug.log";
-}
+
+constexpr const char* kRoot =
+    "sdmc:/switch/gamenative_nx";
+
+constexpr const char* kNativeDir =
+    "sdmc:/switch/gamenative_nx/native/arm64-v8a";
+
+constexpr const char* kRuntimeDir =
+    "sdmc:/switch/gamenative_nx/runtime";
+
+constexpr const char* kGamesDir =
+    "sdmc:/switch/gamenative_nx/games";
+
+constexpr const char* kLog =
+    "sdmc:/switch/gamenative_nx/debug.log";
 
 bool exists(const char* path) {
     struct stat st{};
@@ -26,7 +33,8 @@ bool exists(const char* path) {
 
 size_t count_entries(const char* dir_path, const char* suffix) {
     DIR* dir = opendir(dir_path);
-    if (!dir) return 0;
+    if (!dir)
+        return 0;
 
     size_t count = 0;
 
@@ -46,7 +54,8 @@ size_t count_entries(const char* dir_path, const char* suffix) {
 
 void append_log(const char* message) {
     FILE* f = std::fopen(kLog, "a");
-    if (!f) return;
+    if (!f)
+        return;
 
     std::fprintf(f, "%s\n", message);
     std::fclose(f);
@@ -54,7 +63,8 @@ void append_log(const char* message) {
 
 void append_logf(const char* fmt, const char* a) {
     FILE* f = std::fopen(kLog, "a");
-    if (!f) return;
+    if (!f)
+        return;
 
     std::fprintf(f, fmt, a);
     std::fprintf(f, "\n");
@@ -79,14 +89,20 @@ std::string hex_addr(void* ptr) {
 void draw_header() {
     std::printf("\x1b[1;1H\x1b[2J");
 
-    std::printf("============================================================\n");
-    std::printf("                 GameNative NX 0.2.0                        \n");
-    std::printf("============================================================\n\n");
+    std::printf(
+        "============================================================\n"
+    );
+
+    std::printf(
+        "                 GameNative NX 0.2.0                        \n"
+    );
+
+    std::printf(
+        "============================================================\n\n"
+    );
 }
 
 bool init_solder() {
-    // Use libsolder's built-in libc/newlib export table for the first
-    // compatibility pass. Android/Bionic exports will be added later.
     const int flags = SOLDER_NO_NRO_EXPORTS;
 
     if (solder_init(flags) != 0) {
@@ -98,15 +114,19 @@ bool init_solder() {
             solder_default_exports,
             solder_num_default_exports) != 0) {
 
-        append_log("libsolder: failed to install default exports");
+        append_log(
+            "libsolder: failed to install default exports"
+        );
+
         solder_quit();
         return false;
     }
 
-    // libsolder searches paths in reverse order. A single explicit path
-    // keeps the first probe deterministic.
     if (solder_add_search_path(kNativeDir) != 0) {
-        append_log("libsolder: failed to add native search path");
+        append_log(
+            "libsolder: failed to add native search path"
+        );
+
         solder_quit();
         return false;
     }
@@ -115,7 +135,10 @@ bool init_solder() {
     return true;
 }
 
-bool inspect_needed(const char* path, std::string& result) {
+bool inspect_needed(
+    const char* path,
+    std::string& result
+) {
     result.clear();
 
     FILE* fp = std::fopen(path, "rb");
@@ -127,13 +150,17 @@ bool inspect_needed(const char* path, std::string& result) {
 
     Elf64_Ehdr ehdr{};
 
-    if (std::fread(&ehdr, 1, sizeof(ehdr), fp) != sizeof(ehdr)) {
+    if (std::fread(
+            &ehdr,
+            1,
+            sizeof(ehdr),
+            fp) != sizeof(ehdr)) {
+
         std::fclose(fp);
         result = "ELF HEADER READ FAILED";
         return false;
     }
 
-    // ELF magic.
     if (ehdr.e_ident[EI_MAG0] != ELFMAG0 ||
         ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
         ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
@@ -144,14 +171,12 @@ bool inspect_needed(const char* path, std::string& result) {
         return false;
     }
 
-    // We expect the Android ARM64 library to be ELF64.
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
         std::fclose(fp);
         result = "NOT ELF64";
         return false;
     }
 
-    // We expect AArch64.
     if (ehdr.e_machine != EM_AARCH64) {
         std::fclose(fp);
         result = "NOT AARCH64";
@@ -193,7 +218,6 @@ bool inspect_needed(const char* path, std::string& result) {
     Elf64_Dyn* dynamic = nullptr;
     size_t dynamic_count = 0;
 
-    // Find PT_DYNAMIC.
     for (int i = 0; i < ehdr.e_phnum; ++i) {
         if (phdrs[i].p_type != PT_DYNAMIC)
             continue;
@@ -204,7 +228,8 @@ bool inspect_needed(const char* path, std::string& result) {
         if (dynamic_count == 0)
             break;
 
-        dynamic = new Elf64_Dyn[dynamic_count];
+        dynamic =
+            new Elf64_Dyn[dynamic_count];
 
         if (std::fseek(
                 fp,
@@ -214,7 +239,10 @@ bool inspect_needed(const char* path, std::string& result) {
             delete[] dynamic;
             delete[] phdrs;
             std::fclose(fp);
-            result = "DYNAMIC SECTION SEEK FAILED";
+
+            result =
+                "DYNAMIC SECTION SEEK FAILED";
+
             return false;
         }
 
@@ -227,7 +255,10 @@ bool inspect_needed(const char* path, std::string& result) {
             delete[] dynamic;
             delete[] phdrs;
             std::fclose(fp);
-            result = "DYNAMIC SECTION READ FAILED";
+
+            result =
+                "DYNAMIC SECTION READ FAILED";
+
             return false;
         }
 
@@ -237,6 +268,7 @@ bool inspect_needed(const char* path, std::string& result) {
     if (!dynamic) {
         delete[] phdrs;
         std::fclose(fp);
+
         result = "NO PT_DYNAMIC";
         return false;
     }
@@ -244,10 +276,10 @@ bool inspect_needed(const char* path, std::string& result) {
     Elf64_Addr strtab_va = 0;
     size_t needed_count = 0;
 
-    // Find the string table and count DT_NEEDED entries.
     for (size_t i = 0; i < dynamic_count; ++i) {
         if (dynamic[i].d_tag == DT_STRTAB) {
-            strtab_va = dynamic[i].d_un.d_ptr;
+            strtab_va =
+                dynamic[i].d_un.d_ptr;
         }
         else if (dynamic[i].d_tag == DT_NEEDED) {
             ++needed_count;
@@ -258,16 +290,17 @@ bool inspect_needed(const char* path, std::string& result) {
         delete[] dynamic;
         delete[] phdrs;
         std::fclose(fp);
+
         result = "DT_STRTAB NOT FOUND";
         return false;
     }
 
-    // Translate an ELF virtual address into a file offset.
     auto va_to_offset =
         [&](Elf64_Addr va, Elf64_Off& out) -> bool {
 
         for (int i = 0; i < ehdr.e_phnum; ++i) {
-            const Elf64_Phdr& ph = phdrs[i];
+            const Elf64_Phdr& ph =
+                phdrs[i];
 
             if (ph.p_type != PT_LOAD)
                 continue;
@@ -288,11 +321,17 @@ bool inspect_needed(const char* path, std::string& result) {
 
     Elf64_Off strtab_offset = 0;
 
-    if (!va_to_offset(strtab_va, strtab_offset)) {
+    if (!va_to_offset(
+            strtab_va,
+            strtab_offset)) {
+
         delete[] dynamic;
         delete[] phdrs;
         std::fclose(fp);
-        result = "CANNOT MAP DT_STRTAB";
+
+        result =
+            "CANNOT MAP DT_STRTAB";
+
         return false;
     }
 
@@ -301,7 +340,10 @@ bool inspect_needed(const char* path, std::string& result) {
         std::to_string(needed_count) +
         "):\n";
 
-    for (size_t i = 0; i < dynamic_count; ++i) {
+    for (size_t i = 0;
+         i < dynamic_count;
+         ++i) {
+
         if (dynamic[i].d_tag != DT_NEEDED)
             continue;
 
@@ -314,16 +356,19 @@ bool inspect_needed(const char* path, std::string& result) {
                 static_cast<long>(name_offset),
                 SEEK_SET) != 0) {
 
-            result += "  <seek failed>\n";
+            result +=
+                "  <seek failed>\n";
+
             continue;
         }
 
         std::string name;
         char c = 0;
 
-        while (name.size() < 1024 &&
-               std::fread(&c, 1, 1, fp) == 1 &&
-               c != '\0') {
+        while (
+            name.size() < 1024 &&
+            std::fread(&c, 1, 1, fp) == 1 &&
+            c != '\0') {
 
             name += c;
         }
@@ -348,12 +393,12 @@ bool inspect_needed(const char* path, std::string& result) {
 void probe_winlator(std::string& result) {
     result.clear();
 
-    std::printf("\nProbing libwinlator.so...\n");
+    std::printf(
+        "\nProbing libwinlator.so...\n"
+    );
+
     consoleUpdate(nullptr);
 
-    // LAZY + NO_AUTOLOAD:
-    // Load only this ELF. Do not recursively load its Android
-    // dependencies yet.
     const int flags =
         SOLDER_LAZY |
         SOLDER_NO_AUTOLOAD;
@@ -368,7 +413,9 @@ void probe_winlator(std::string& result) {
         solder_dlerror();
 
     if (!handle) {
-        result = "LOAD FAILED\n";
+        result =
+            "LOAD FAILED\n";
+
         result +=
             err
                 ? err
@@ -390,7 +437,9 @@ void probe_winlator(std::string& result) {
     void* text =
         solder_get_text_addr(handle);
 
-    result += "ELF LOAD OK\n";
+    result +=
+        "ELF LOAD OK\n";
+
     result +=
         "base: " +
         hex_addr(base) +
@@ -401,7 +450,6 @@ void probe_winlator(std::string& result) {
         hex_addr(text) +
         "\n\n";
 
-    // Inspect the original ELF directly from SD.
     std::string needed;
 
     const bool needed_ok =
@@ -434,7 +482,8 @@ void probe_winlator(std::string& result) {
     }
 
     append_log(
-        "libwinlator.so probe: ELF load succeeded (lazy/no-autoload)"
+        "libwinlator.so probe: "
+        "ELF load succeeded (lazy/no-autoload)"
     );
 
     solder_dlclose(handle);
@@ -443,7 +492,9 @@ void probe_winlator(std::string& result) {
         solder_dlerror();
 
     if (close_err) {
-        result += "\nclose: ";
+        result +=
+            "\nclose: ";
+
         result += close_err;
 
         append_logf(
@@ -452,6 +503,8 @@ void probe_winlator(std::string& result) {
         );
     }
 }
+
+} // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
     consoleInit(nullptr);
@@ -570,7 +623,7 @@ int main(int /*argc*/, char** /*argv*/) {
             );
 
             std::printf(
-                "                PROBE RESULT\n"
+                "                    PROBE RESULT\n"
             );
 
             std::printf(
