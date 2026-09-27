@@ -6,6 +6,8 @@ ifeq ($(strip $(DEVKITPRO)),)
 $(error "Set DEVKITPRO in your environment (for example /opt/devkitpro)")
 endif
 
+export PATH := $(DEVKITPRO)/devkitA64/bin:$(DEVKITPRO)/tools/bin:$(PATH)
+
 TOPDIR ?= $(CURDIR)
 SOLDER_DIR := $(TOPDIR)/third_party/libsolder
 SOLDER_LIB := $(SOLDER_DIR)/lib/libsolder.a
