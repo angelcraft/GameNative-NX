@@ -1505,6 +1505,131 @@ void probe_winlator_11(std::string& result) {
     solder_dlclose(handle);
 }
 
+
+void probe_xconnector(std::string& result) {
+    result += "\n\n================ LIBXCONNECTORPATCH ================\n";
+
+    append_log("libxconnectorpatch.so probe: starting");
+
+    const int flags =
+        SOLDER_LAZY |
+        SOLDER_NO_AUTOLOAD;
+
+    void* handle =
+        solder_dlopen(
+            "libxconnectorpatch.so",
+            flags
+        );
+
+    const char* err = solder_dlerror();
+
+    if (!handle) {
+        result += "LOAD FAILED\n";
+        result += err ? err : "(no error text)";
+        result += "\n";
+
+        append_logf(
+            "libxconnectorpatch.so probe failed: %s",
+            err ? err : "(no error text)"
+        );
+        return;
+    }
+
+    result += "ELF LOAD OK\n";
+    result +=
+        "base: " +
+        hex_addr(solder_get_base_addr(handle)) +
+        "\n";
+    result +=
+        "text: " +
+        hex_addr(solder_get_text_addr(handle)) +
+        "\n\n";
+
+    std::string needed;
+    const bool needed_ok = inspect_needed(
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libxconnectorpatch.so",
+        needed
+    );
+
+    if (needed_ok) {
+        result += needed;
+        append_log("libxconnectorpatch.so dependencies:");
+        append_log(needed.c_str());
+    } else {
+        result += "DEPENDENCY INSPECTION FAILED\n";
+        result += needed;
+        append_logf(
+            "libxconnectorpatch.so dependency inspection failed: %s",
+            needed.c_str()
+        );
+    }
+
+    std::string symbol_screen;
+    std::string symbol_full;
+
+    const bool symbols_ok = inspect_undefined_symbols(
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libxconnectorpatch.so",
+        symbol_screen,
+        symbol_full
+    );
+
+    result += "\nSTATIC SYMBOL INSPECTION:\n";
+    result += symbol_screen;
+
+    append_log("libxconnectorpatch.so static undefined symbols:");
+    append_log(symbol_full.c_str());
+
+    append_log(
+        "libxconnectorpatch.so probe: "
+        "ELF load succeeded (lazy/no-autoload)"
+    );
+
+    result +=
+        "\nRELOCATION TEST: "
+        "Java_com_winlator_xconnector_XConnectorEpoll_createEpollFd\n";
+
+    append_log(
+        "libxconnectorpatch.so relocation test: "
+        "calling solder_dlsym("
+        "Java_com_winlator_xconnector_XConnectorEpoll_createEpollFd)"
+    );
+
+    void* resolved = solder_dlsym(
+        handle,
+        "Java_com_winlator_xconnector_XConnectorEpoll_createEpollFd"
+    );
+
+    const char* dlsym_err = solder_dlerror();
+
+    if (resolved) {
+        const std::string resolved_text = hex_addr(resolved);
+
+        result += "dlsym: SUCCESS\n";
+        result += "address: " + resolved_text + "\n";
+
+        append_logf(
+            "libxconnectorpatch.so relocation test: "
+            "SUCCESS, createEpollFd=%s",
+            resolved_text.c_str()
+        );
+
+        // Keep the module alive for diagnostics.
+        return;
+    }
+
+    result += "dlsym: FAILED\n";
+    result += "error: ";
+    result += dlsym_err ? dlsym_err : "(no error text)";
+    result += "\n";
+
+    append_logf(
+        "libxconnectorpatch.so relocation test: FAILED: %s",
+        dlsym_err ? dlsym_err : "(no error text)"
+    );
+
+    solder_dlclose(handle);
+}
+
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
@@ -1596,7 +1721,7 @@ int main(int /*argc*/, char** /*argv*/) {
         );
 
         std::printf(
-            "  A      Inspect libwinlator.so + libwinlator_11.so\n"
+            "  A      Inspect winlator + xconnectorpatch\n"
         );
 
         std::printf(
@@ -1653,6 +1778,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
             probe_winlator(probe_result);
             probe_winlator_11(probe_result);
+            probe_xconnector(probe_result);
             probed = true;
         }
 
