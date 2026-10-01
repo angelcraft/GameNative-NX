@@ -417,10 +417,11 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 // ============================================================================
 //
 // mmap/munmap are still resolution-only placeholders. eventfd gets a small
-// functional compatibility layer backed by a pipe. The read end is returned
-// to Android code, while writes are redirected to the hidden write end. This
-// is enough to provide an fd that participates in poll/epoll and can be
-// cleaned up without leaking the paired descriptor.
+// functional compatibility layer backed by an AF_UNIX socketpair. One end is
+// returned to Android code, while writes are redirected to the hidden peer.
+// This provides a real fd that participates in poll/epoll and can be cleaned
+// up without leaking the paired descriptor. It is a compatibility bridge, not
+// a full kernel-accurate eventfd counter/semaphore implementation.
 
 extern "C" void* gn_android_mmap(
     void* /*addr*/,
@@ -476,39 +477,48 @@ extern "C" int gn_android_eventfd(
     unsigned int initval,
     int flags
 ) {
-    int pipe_fds[2] = {-1, -1};
+    int socket_fds[2] = {-1, -1};
 
-    if (::pipe(pipe_fds) != 0)
+    // libnx exposes socketpair() through its BSD socket compatibility layer,
+    // whereas pipe() is not available as a linkable symbol in the current
+    // devkit/libnx environment used by this project.
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, socket_fds) != 0)
         return -1;
 
     if (flags & kAndroidEfdNonblock) {
-        const int read_flags = ::fcntl(pipe_fds[0], F_GETFL, 0);
-        const int write_flags = ::fcntl(pipe_fds[1], F_GETFL, 0);
+        const int read_flags = ::fcntl(socket_fds[0], F_GETFL, 0);
+        const int write_flags = ::fcntl(socket_fds[1], F_GETFL, 0);
 
         if (read_flags < 0 || write_flags < 0 ||
-            ::fcntl(pipe_fds[0], F_SETFL, read_flags | O_NONBLOCK) != 0 ||
-            ::fcntl(pipe_fds[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
-            ::close(pipe_fds[0]);
-            ::close(pipe_fds[1]);
+            ::fcntl(socket_fds[0], F_SETFL, read_flags | O_NONBLOCK) != 0 ||
+            ::fcntl(socket_fds[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
+            ::close(socket_fds[0]);
+            ::close(socket_fds[1]);
             return -1;
         }
     }
 
     EventFdShim* shim = allocate_eventfd_shim();
     if (!shim) {
-        ::close(pipe_fds[0]);
-        ::close(pipe_fds[1]);
+        ::close(socket_fds[0]);
+        ::close(socket_fds[1]);
         errno = EMFILE;
         return -1;
     }
 
-    shim->read_fd = pipe_fds[0];
-    shim->write_fd = pipe_fds[1];
+    shim->read_fd = socket_fds[0];
+    shim->write_fd = socket_fds[1];
 
     if (initval != 0) {
         const uint64_t value = initval;
-        if (::write(shim->write_fd, &value, sizeof(value)) !=
-            static_cast<ssize_t>(sizeof(value))) {
+        const ssize_t rc = ::send(
+            shim->write_fd,
+            &value,
+            sizeof(value),
+            0
+        );
+
+        if (rc != static_cast<ssize_t>(sizeof(value))) {
             ::close(shim->read_fd);
             ::close(shim->write_fd);
             shim->read_fd = -1;
@@ -529,7 +539,7 @@ extern "C" ssize_t gn_android_eventfd_read(
     if (!shim)
         return ::read(fd, buf, count);
 
-    return ::read(shim->read_fd, buf, count);
+    return ::recv(shim->read_fd, buf, count, 0);
 }
 
 extern "C" ssize_t gn_android_eventfd_write(
@@ -541,7 +551,7 @@ extern "C" ssize_t gn_android_eventfd_write(
     if (!shim)
         return ::write(fd, buf, count);
 
-    return ::write(shim->write_fd, buf, count);
+    return ::send(shim->write_fd, buf, count, 0);
 }
 
 extern "C" int gn_android_close(
@@ -565,6 +575,7 @@ extern "C" int gn_android_close(
 
     return write_rc;
 }
+
 
 
 // ============================================================================
@@ -1115,6 +1126,16 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT(
         "__write_chk",
         (void*)&gn_android_write_chk
+    ),
+
+    SOLDER_EXPORT(
+        "read",
+        (void*)&gn_android_eventfd_read
+    ),
+
+    SOLDER_EXPORT(
+        "write",
+        (void*)&gn_android_eventfd_write
     ),
 
     SOLDER_EXPORT(
