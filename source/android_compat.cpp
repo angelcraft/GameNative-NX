@@ -3,6 +3,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -405,40 +406,153 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 }
 
 
+
 // ============================================================================
-// Additional resolution-only POSIX placeholders
+// Dynamic-loader compatibility
 // ============================================================================
 //
-// These are deliberately NOT real Linux mmap/eventfd implementations yet.
-// They only make the ELF imports resolvable so we can move to the next
-// diagnostic stage without pulling in a missing <sys/mman.h> API.
+// Android code expects the POSIX/Bionic dlopen/dlsym/dlclose API.  On Switch,
+// libsolder is the loader we use for the imported ARM64 ELF objects, so these
+// wrappers translate the familiar API onto libsolder rather than attempting
+// to use a host/Android libdl implementation.
 //
-extern "C" void* gn_android_mmap(
-    void* /*addr*/,
-    size_t /*length*/,
-    int /*prot*/,
-    int /*flags*/,
-    int /*fd*/,
-    int64_t /*offset*/
+// We deliberately use SOLDER_NO_AUTOLOAD here.  The Android system libraries
+// referenced by the APK are represented by our main export table instead of
+// real .so files on the SD card.  Preventing automatic dependency loading
+// keeps that model consistent while still allowing bundled GameNative .so
+// files to be opened explicitly.
+//
+extern "C" void* gn_android_dlopen(
+    const char* filename,
+    int flags
 ) {
-    errno = ENOSYS;
-    return reinterpret_cast<void*>(-1);
+    if (!filename) {
+        errno = EINVAL;
+        return nullptr;
+    }
+
+    int solder_flags = SOLDER_NO_AUTOLOAD;
+
+    // RTLD_LAZY == 0x1 on the Android/Linux ABI.
+    if (flags & 0x1)
+        solder_flags |= SOLDER_LAZY;
+
+    return solder_dlopen(
+        filename,
+        solder_flags
+    );
 }
 
-extern "C" int gn_android_munmap(
-    void* /*addr*/,
-    size_t /*length*/
+extern "C" void* gn_android_dlsym(
+    void* handle,
+    const char* symbol
 ) {
-    errno = ENOSYS;
-    return -1;
+    if (!handle || !symbol) {
+        errno = EINVAL;
+        return nullptr;
+    }
+
+    return solder_dlsym(
+        handle,
+        symbol
+    );
 }
 
-extern "C" int gn_android_eventfd(
-    unsigned int /*initval*/,
-    int /*flags*/
+extern "C" int gn_android_dlclose(
+    void* handle
 ) {
-    errno = ENOSYS;
-    return -1;
+    if (!handle) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    return solder_dlclose(handle);
+}
+
+extern "C" const char* gn_android_dlerror() {
+    return solder_dlerror();
+}
+
+
+// ============================================================================
+// Additional libc compatibility
+// ============================================================================
+
+extern "C" long gn_android_strtol(
+    const char* nptr,
+    char** endptr,
+    int base
+) {
+    return std::strtol(
+        nptr,
+        endptr,
+        base
+    );
+}
+
+extern "C" size_t gn_android_strlen_chk(
+    const char* str,
+    size_t /*maxlen*/
+) {
+    if (!str) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    return std::strlen(str);
+}
+
+extern "C" size_t gn_android_fwrite_chk(
+    const void* ptr,
+    size_t size,
+    size_t count,
+    FILE* stream,
+    size_t /*buflen*/
+) {
+    if (!stream) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    return std::fwrite(
+        ptr,
+        size,
+        count,
+        stream
+    );
+}
+
+
+// ============================================================================
+// pthread compatibility
+// ============================================================================
+
+extern "C" int gn_android_pthread_create(
+    pthread_t* thread,
+    const pthread_attr_t* attr,
+    void* (*start_routine)(void*),
+    void* arg
+) {
+    return ::pthread_create(
+        thread,
+        attr,
+        start_routine,
+        arg
+    );
+}
+
+extern "C" int gn_android_pthread_join(
+    pthread_t thread,
+    void** retval
+) {
+    return ::pthread_join(
+        thread,
+        retval
+    );
+}
+
+extern "C" pthread_t gn_android_pthread_self() {
+    return ::pthread_self();
 }
 
 
@@ -860,6 +974,23 @@ static const solder_export_t kAndroidCompatExports[] = {
         (void*)&gn_android_syscall
     ),
 
+
+    // Dynamic loader API used by libwinlator_11.so.
+    SOLDER_EXPORT("dlopen", (void*)&gn_android_dlopen),
+    SOLDER_EXPORT("dlsym", (void*)&gn_android_dlsym),
+    SOLDER_EXPORT("dlclose", (void*)&gn_android_dlclose),
+    SOLDER_EXPORT("dlerror", (void*)&gn_android_dlerror),
+
+    // Additional libc / fortify helpers used by libwinlator_11.so.
+    SOLDER_EXPORT("strtol", (void*)&gn_android_strtol),
+    SOLDER_EXPORT("__strlen_chk", (void*)&gn_android_strlen_chk),
+    SOLDER_EXPORT("__fwrite_chk", (void*)&gn_android_fwrite_chk),
+
+    // pthread entry points used by libwinlator_11.so.
+    SOLDER_EXPORT("pthread_create", (void*)&gn_android_pthread_create),
+    SOLDER_EXPORT("pthread_join", (void*)&gn_android_pthread_join),
+    SOLDER_EXPORT("pthread_self", (void*)&gn_android_pthread_self),
+
     // ------------------------------------------------------------------------
     // Resolution-only Android / C++ runtime / graphics placeholders.
     // ------------------------------------------------------------------------
@@ -893,11 +1024,6 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("vkCreateInstance", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("vkEnumeratePhysicalDevices", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("vkEnumerateDeviceExtensionProperties", (void*)&gn_android_unimplemented),
-
-    // Additional resolution-only POSIX placeholders.
-    SOLDER_EXPORT("mmap", (void*)&gn_android_mmap),
-    SOLDER_EXPORT("munmap", (void*)&gn_android_munmap),
-    SOLDER_EXPORT("eventfd", (void*)&gn_android_eventfd),
 };
 
 
