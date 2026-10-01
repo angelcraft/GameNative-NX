@@ -1617,6 +1617,9 @@ void probe_xconnector(std::string& result) {
         // arguments and directly calls epoll_create(10). We pass null JNI
         // placeholders because no Java VM is present in GameNative NX.
         using CreateEpollFdFn = int (*)(void*, void*);
+        using CreateEventFdFn = int (*)(void*, void*);
+        using AddFdToEpollFn = int (*)(void*, void*, int, int);
+        using RemoveFdFromEpollFn = void (*)(void*, void*, int, int);
         using CloseFdFn = int (*)(void*, void*, int);
 
         auto create_epoll_fd =
@@ -1641,6 +1644,135 @@ void probe_xconnector(std::string& result) {
             "\n";
 
         if (epoll_fd >= 0) {
+            // Second real execution test: createEventFd().
+            // This JNI wrapper directly calls eventfd(0, EFD_NONBLOCK).
+            append_log(
+                "libxconnectorpatch.so execution test: "
+                "calling createEventFd"
+            );
+
+            void* create_event_symbol = solder_dlsym(
+                handle,
+                "Java_com_winlator_xconnector_XConnectorEpollNative_createEventFd"
+            );
+
+            const char* create_event_err = solder_dlerror();
+            int event_fd = -1;
+
+            if (create_event_symbol) {
+                auto create_event_fd =
+                    reinterpret_cast<CreateEventFdFn>(create_event_symbol);
+
+                event_fd = create_event_fd(nullptr, nullptr);
+
+                char line[128];
+                std::snprintf(
+                    line,
+                    sizeof(line),
+                    "libxconnectorpatch.so execution test: createEventFd returned %d",
+                    event_fd
+                );
+                append_log(line);
+
+                result +=
+                    "execute createEventFd: returned " +
+                    std::to_string(event_fd) +
+                    "\n";
+            } else {
+                append_logf(
+                    "libxconnectorpatch.so execution test: "
+                    "createEventFd dlsym failed: %s",
+                    create_event_err ? create_event_err : "(no error text)"
+                );
+
+                result +=
+                    "createEventFd dlsym FAILED: " +
+                    std::string(create_event_err ? create_event_err : "(no error text)") +
+                    "\n";
+            }
+
+            // Third test: exercise add/remove through the actual JNI wrapper
+            // using the event fd when the compatibility layer provides one.
+            if (event_fd >= 0) {
+                void* add_symbol = solder_dlsym(
+                    handle,
+                    "Java_com_winlator_xconnector_XConnectorEpollNative_addFdToEpoll"
+                );
+
+                const char* add_err = solder_dlerror();
+
+                if (add_symbol) {
+                    auto add_fd =
+                        reinterpret_cast<AddFdToEpollFn>(add_symbol);
+
+                    int add_result =
+                        add_fd(nullptr, nullptr, epoll_fd, event_fd);
+
+                    char line[128];
+                    std::snprintf(
+                        line,
+                        sizeof(line),
+                        "libxconnectorpatch.so execution test: addFdToEpoll returned %d",
+                        add_result
+                    );
+                    append_log(line);
+
+                    result +=
+                        "execute addFdToEpoll: returned " +
+                        std::to_string(add_result) +
+                        "\n";
+
+                    void* remove_symbol = solder_dlsym(
+                        handle,
+                        "Java_com_winlator_xconnector_XConnectorEpollNative_removeFdFromEpoll"
+                    );
+
+                    const char* remove_err = solder_dlerror();
+
+                    if (remove_symbol) {
+                        auto remove_fd =
+                            reinterpret_cast<RemoveFdFromEpollFn>(remove_symbol);
+
+                        remove_fd(
+                            nullptr,
+                            nullptr,
+                            epoll_fd,
+                            event_fd
+                        );
+
+                        append_log(
+                            "libxconnectorpatch.so execution test: "
+                            "removeFdFromEpoll returned"
+                        );
+
+                        result +=
+                            "execute removeFdFromEpoll: completed\n";
+                    } else {
+                        append_logf(
+                            "libxconnectorpatch.so execution test: "
+                            "removeFdFromEpoll dlsym failed: %s",
+                            remove_err ? remove_err : "(no error text)"
+                        );
+
+                        result +=
+                            "removeFdFromEpoll dlsym FAILED: " +
+                            std::string(remove_err ? remove_err : "(no error text)") +
+                            "\n";
+                    }
+                } else {
+                    append_logf(
+                        "libxconnectorpatch.so execution test: "
+                        "addFdToEpoll dlsym failed: %s",
+                        add_err ? add_err : "(no error text)"
+                    );
+
+                    result +=
+                        "addFdToEpoll dlsym FAILED: " +
+                        std::string(add_err ? add_err : "(no error text)") +
+                        "\n";
+                }
+            }
+
             void* close_symbol = solder_dlsym(
                 handle,
                 "Java_com_winlator_xconnector_XConnectorEpollNative_closeFd"
@@ -1670,6 +1802,26 @@ void probe_xconnector(std::string& result) {
                     "execute closeFd: returned " +
                     std::to_string(close_result) +
                     "\n";
+
+                if (event_fd >= 0) {
+                    int event_close_result =
+                        close_fd(nullptr, nullptr, event_fd);
+
+                    char line[128];
+                    std::snprintf(
+                        line,
+                        sizeof(line),
+                        "libxconnectorpatch.so execution cleanup: "
+                        "eventFd closeFd returned %d",
+                        event_close_result
+                    );
+                    append_log(line);
+
+                    result +=
+                        "execute eventFd closeFd: returned " +
+                        std::to_string(event_close_result) +
+                        "\n";
+                }
             } else {
                 append_logf(
                     "libxconnectorpatch.so execution cleanup: "
