@@ -408,6 +408,42 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 
 
 // ============================================================================
+// mmap / munmap / eventfd compatibility placeholders
+// ============================================================================
+//
+// These are currently resolution-safe shims so Android/Bionic imports can be
+// relocated by libsolder. They are not full Linux/Horizon implementations yet.
+
+extern "C" void* gn_android_mmap(
+    void* /*addr*/,
+    size_t /*length*/,
+    int /*prot*/,
+    int /*flags*/,
+    int /*fd*/,
+    int64_t /*offset*/
+) {
+    errno = ENOSYS;
+    return reinterpret_cast<void*>(-1);
+}
+
+extern "C" int gn_android_munmap(
+    void* /*addr*/,
+    size_t /*length*/
+) {
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int gn_android_eventfd(
+    unsigned int /*initval*/,
+    int /*flags*/
+) {
+    errno = ENOSYS;
+    return -1;
+}
+
+
+// ============================================================================
 // Dynamic-loader compatibility
 // ============================================================================
 //
@@ -974,6 +1010,11 @@ static const solder_export_t kAndroidCompatExports[] = {
         (void*)&gn_android_syscall
     ),
 
+
+    // mmap / munmap / eventfd are required by libwinlator.so as well.
+    SOLDER_EXPORT("mmap", (void*)&gn_android_mmap),
+    SOLDER_EXPORT("munmap", (void*)&gn_android_munmap),
+    SOLDER_EXPORT("eventfd", (void*)&gn_android_eventfd),
 
     // Dynamic loader API used by libwinlator_11.so.
     SOLDER_EXPORT("dlopen", (void*)&gn_android_dlopen),
