@@ -1,1070 +1,1671 @@
+#include <switch.h>
+#include <solder.h>
 #include "android_compat.hpp"
 
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <pthread.h>
-
-#include <cerrno>
-#include <cstdint>
-#include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <cwchar>
-
-#ifndef GN_CMSG_ALIGN
-#define GN_CMSG_ALIGN(len) \
-    (((len) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
-#endif
+#include <dirent.h>
+#include <sys/stat.h>
+#include <string>
+#include <elf.h>
+#include <cstdint>
 
 namespace {
 
-constexpr int kMaxEpollInstances = 8;
-constexpr int kMaxEpollWatches = 64;
+constexpr const char* kRoot =
+    "sdmc:/switch/gamenative_nx";
 
-// Android/Bionic epoll constants.
-constexpr uint32_t GN_EPOLLIN       = 0x00000001;
-constexpr uint32_t GN_EPOLLPRI      = 0x00000002;
-constexpr uint32_t GN_EPOLLOUT      = 0x00000004;
-constexpr uint32_t GN_EPOLLERR      = 0x00000008;
-constexpr uint32_t GN_EPOLLHUP      = 0x00000010;
-constexpr uint32_t GN_EPOLLRDNORM   = 0x00000040;
-constexpr uint32_t GN_EPOLLRDBAND   = 0x00000080;
-constexpr uint32_t GN_EPOLLWRNORM   = 0x00000100;
-constexpr uint32_t GN_EPOLLWRBAND   = 0x00000200;
-constexpr uint32_t GN_EPOLLRDHUP    = 0x00002000;
-constexpr uint32_t GN_EPOLLWAKEUP   = 0x20000000;
-constexpr uint32_t GN_EPOLLONESHOT  = 0x40000000;
-constexpr uint32_t GN_EPOLLET       = 0x80000000;
+constexpr const char* kNativeDir =
+    "sdmc:/switch/gamenative_nx/native/arm64-v8a";
 
-constexpr int GN_EPOLL_CTL_ADD = 1;
-constexpr int GN_EPOLL_CTL_DEL = 2;
-constexpr int GN_EPOLL_CTL_MOD = 3;
+constexpr const char* kRuntimeDir =
+    "sdmc:/switch/gamenative_nx/runtime";
 
-// ABI-compatible with Android's AArch64 epoll_event.
-struct gn_epoll_event {
-    uint32_t events;
+constexpr const char* kGamesDir =
+    "sdmc:/switch/gamenative_nx/games";
 
-    union {
-        void* ptr;
-        int fd;
-        uint32_t u32;
-        uint64_t u64;
-    } data;
-};
+constexpr const char* kLog =
+    "sdmc:/switch/gamenative_nx/debug.log";
 
-struct EpollWatch {
-    bool used = false;
-    int fd = -1;
-    uint32_t events = 0;
-    gn_epoll_event user_event{};
-};
+constexpr size_t kScreenSymbolLimit = 40;
 
-struct EpollInstance {
-    bool used = false;
-
-    // Real OS fd used as a unique epoll handle.
-    // The implementation itself uses poll() on the watched fds.
-    int handle_fd = -1;
-
-    EpollWatch watches[kMaxEpollWatches];
-};
-
-EpollInstance g_epolls[kMaxEpollInstances];
-
-EpollInstance* find_epoll(int epfd) {
-    for (int i = 0; i < kMaxEpollInstances; ++i) {
-        if (g_epolls[i].used &&
-            g_epolls[i].handle_fd == epfd) {
-
-            return &g_epolls[i];
-        }
-    }
-
-    return nullptr;
+bool exists(const char* path) {
+    struct stat st{};
+    return stat(path, &st) == 0;
 }
 
-EpollWatch* find_watch(
-    EpollInstance* ep,
-    int fd
-) {
-    if (!ep)
-        return nullptr;
-
-    for (int i = 0; i < kMaxEpollWatches; ++i) {
-        if (ep->watches[i].used &&
-            ep->watches[i].fd == fd) {
-
-            return &ep->watches[i];
-        }
-    }
-
-    return nullptr;
-}
-
-EpollWatch* allocate_watch(EpollInstance* ep) {
-    if (!ep)
-        return nullptr;
-
-    for (int i = 0; i < kMaxEpollWatches; ++i) {
-        if (!ep->watches[i].used)
-            return &ep->watches[i];
-    }
-
-    return nullptr;
-}
-
-short epoll_to_poll_events(uint32_t events) {
-    short result = 0;
-
-    if (events & (
-            GN_EPOLLIN |
-            GN_EPOLLRDNORM)) {
-
-        result |= POLLIN;
-    }
-
-    if (events & (
-            GN_EPOLLOUT |
-            GN_EPOLLWRNORM)) {
-
-        result |= POLLOUT;
-    }
-
-    if (events & GN_EPOLLPRI)
-        result |= POLLPRI;
-
-    return result;
-}
-
-uint32_t poll_to_epoll_events(
-    short revents
-) {
-    uint32_t result = 0;
-
-    if (revents & POLLIN)
-        result |= GN_EPOLLIN;
-
-    if (revents & POLLOUT)
-        result |= GN_EPOLLOUT;
-
-    if (revents & POLLPRI)
-        result |= GN_EPOLLPRI;
-
-    if (revents & POLLERR)
-        result |= GN_EPOLLERR;
-
-    if (revents & POLLHUP)
-        result |= GN_EPOLLHUP;
-
-#ifdef POLLRDHUP
-    if (revents & POLLRDHUP)
-        result |= GN_EPOLLRDHUP;
-#endif
-
-    return result;
-}
-
-} // namespace
-
-
-// ============================================================================
-// Basic POSIX compatibility
-// ============================================================================
-
-extern "C" int gn_android_socket(
-    int domain,
-    int type,
-    int protocol
-) {
-    return ::socket(domain, type, protocol);
-}
-
-extern "C" int gn_android_bind(
-    int sockfd,
-    const struct sockaddr* addr,
-    socklen_t addrlen
-) {
-    return ::bind(sockfd, addr, addrlen);
-}
-
-extern "C" int gn_android_listen(
-    int sockfd,
-    int backlog
-) {
-    return ::listen(sockfd, backlog);
-}
-
-extern "C" int gn_android_accept(
-    int sockfd,
-    struct sockaddr* addr,
-    socklen_t* addrlen
-) {
-    return ::accept(sockfd, addr, addrlen);
-}
-
-extern "C" int gn_android_poll(
-    struct pollfd* fds,
-    nfds_t nfds,
-    int timeout
-) {
-    return ::poll(fds, nfds, timeout);
-}
-
-extern "C" int gn_android_unlink(
-    const char* path
-) {
-    return ::unlink(path);
-}
-
-extern "C" int gn_android_ftruncate(
-    int fd,
-    off_t length
-) {
-    return ::ftruncate(fd, length);
-}
-
-
-// ============================================================================
-// New libc / POSIX compatibility functions
-// ============================================================================
-
-extern "C" ssize_t gn_android_read_chk(
-    int fd,
-    void* buf,
-    size_t count,
-    size_t /*buflen*/
-) {
-    return ::read(
-        fd,
-        buf,
-        count
-    );
-}
-
-extern "C" ssize_t gn_android_write_chk(
-    int fd,
-    const void* buf,
-    size_t count,
-    size_t /*buflen*/
-) {
-    return ::write(
-        fd,
-        buf,
-        count
-    );
-}
-
-extern "C" int gn_android_vsprintf_chk(
-    char* dst,
-    int /*flag*/,
-    size_t dst_len,
-    const char* fmt,
-    va_list ap
-) {
-    if (!dst || !fmt) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (dst_len == 0) {
-        errno = ERANGE;
-        return -1;
-    }
-
-    return std::vsnprintf(
-        dst,
-        dst_len,
-        fmt,
-        ap
-    );
-}
-
-
-extern "C" char* gn_android_strdup(
-    const char* src
-) {
-    if (!src) {
-        errno = EINVAL;
-        return nullptr;
-    }
-
-    return ::strdup(src);
-}
-
-extern "C" void gn_android_qsort(
-    void* base,
-    size_t nmemb,
-    size_t size,
-    int (*compar)(
-        const void*,
-        const void*
-    )
-) {
-    ::qsort(
-        base,
-        nmemb,
-        size,
-        compar
-    );
-}
-
-extern "C" wchar_t* gn_android_fgetws(
-    wchar_t* ws,
-    int n,
-    FILE* stream
-) {
-    return ::fgetws(
-        ws,
-        n,
-        stream
-    );
-}
-
-extern "C" ssize_t gn_android_sendmsg(
-    int sockfd,
-    const struct msghdr* msg,
-    int flags
-) {
-    return ::sendmsg(
-        sockfd,
-        msg,
-        flags
-    );
-}
-
-extern "C" ssize_t gn_android_recvmsg(
-    int sockfd,
-    struct msghdr* msg,
-    int flags
-) {
-    return ::recvmsg(
-        sockfd,
-        msg,
-        flags
-    );
-}
-
-extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
-    struct msghdr* msg,
-    struct cmsghdr* cmsg
-) {
-    if (!msg || !msg->msg_control)
-        return nullptr;
-
-    const size_t alignment = sizeof(size_t);
-
-    auto align_len = [alignment](size_t len) -> size_t {
-        return (len + alignment - 1) &
-               ~(alignment - 1);
-    };
-
-    unsigned char* base =
-        static_cast<unsigned char*>(
-            msg->msg_control
-        );
-
-    unsigned char* end =
-        base + msg->msg_controllen;
-
-    if (!cmsg) {
-        if (base + sizeof(struct cmsghdr) > end)
-            return nullptr;
-
-        return reinterpret_cast<struct cmsghdr*>(base);
-    }
-
-    unsigned char* current =
-        reinterpret_cast<unsigned char*>(cmsg);
-
-    if (current < base ||
-        current + sizeof(struct cmsghdr) > end) {
-
-        return nullptr;
-    }
-
-    if (cmsg->cmsg_len < sizeof(struct cmsghdr))
-        return nullptr;
-
-    unsigned char* next =
-        current + align_len(cmsg->cmsg_len);
-
-    if (next + sizeof(struct cmsghdr) > end)
-        return nullptr;
-
-    struct cmsghdr* next_hdr =
-        reinterpret_cast<struct cmsghdr*>(next);
-
-    if (next_hdr->cmsg_len < sizeof(struct cmsghdr))
-        return nullptr;
-
-    if (next + next_hdr->cmsg_len > end)
-        return nullptr;
-
-    return next_hdr;
-}
-
-
-
-// ============================================================================
-// Dynamic-loader compatibility
-// ============================================================================
-//
-// Android code expects the POSIX/Bionic dlopen/dlsym/dlclose API.  On Switch,
-// libsolder is the loader we use for the imported ARM64 ELF objects, so these
-// wrappers translate the familiar API onto libsolder rather than attempting
-// to use a host/Android libdl implementation.
-//
-// We deliberately use SOLDER_NO_AUTOLOAD here.  The Android system libraries
-// referenced by the APK are represented by our main export table instead of
-// real .so files on the SD card.  Preventing automatic dependency loading
-// keeps that model consistent while still allowing bundled GameNative .so
-// files to be opened explicitly.
-//
-extern "C" void* gn_android_dlopen(
-    const char* filename,
-    int flags
-) {
-    if (!filename) {
-        errno = EINVAL;
-        return nullptr;
-    }
-
-    int solder_flags = SOLDER_NO_AUTOLOAD;
-
-    // RTLD_LAZY == 0x1 on the Android/Linux ABI.
-    if (flags & 0x1)
-        solder_flags |= SOLDER_LAZY;
-
-    return solder_dlopen(
-        filename,
-        solder_flags
-    );
-}
-
-extern "C" void* gn_android_dlsym(
-    void* handle,
-    const char* symbol
-) {
-    if (!handle || !symbol) {
-        errno = EINVAL;
-        return nullptr;
-    }
-
-    return solder_dlsym(
-        handle,
-        symbol
-    );
-}
-
-extern "C" int gn_android_dlclose(
-    void* handle
-) {
-    if (!handle) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    return solder_dlclose(handle);
-}
-
-extern "C" const char* gn_android_dlerror() {
-    return solder_dlerror();
-}
-
-
-// ============================================================================
-// Additional libc compatibility
-// ============================================================================
-
-extern "C" long gn_android_strtol(
-    const char* nptr,
-    char** endptr,
-    int base
-) {
-    return std::strtol(
-        nptr,
-        endptr,
-        base
-    );
-}
-
-extern "C" size_t gn_android_strlen_chk(
-    const char* str,
-    size_t /*maxlen*/
-) {
-    if (!str) {
-        errno = EINVAL;
+size_t count_entries(const char* dir_path, const char* suffix) {
+    DIR* dir = opendir(dir_path);
+    if (!dir)
         return 0;
-    }
 
-    return std::strlen(str);
-}
+    size_t count = 0;
 
-extern "C" size_t gn_android_fwrite_chk(
-    const void* ptr,
-    size_t size,
-    size_t count,
-    FILE* stream,
-    size_t /*buflen*/
-) {
-    if (!stream) {
-        errno = EINVAL;
-        return 0;
-    }
-
-    return std::fwrite(
-        ptr,
-        size,
-        count,
-        stream
-    );
-}
-
-
-// ============================================================================
-// pthread compatibility
-// ============================================================================
-
-extern "C" int gn_android_pthread_create(
-    pthread_t* thread,
-    const pthread_attr_t* attr,
-    void* (*start_routine)(void*),
-    void* arg
-) {
-    return ::pthread_create(
-        thread,
-        attr,
-        start_routine,
-        arg
-    );
-}
-
-extern "C" int gn_android_pthread_join(
-    pthread_t thread,
-    void** retval
-) {
-    return ::pthread_join(
-        thread,
-        retval
-    );
-}
-
-extern "C" pthread_t gn_android_pthread_self() {
-    return ::pthread_self();
-}
-
-
-// ============================================================================
-// Resolution-only placeholders for remaining Android/system imports
-// ============================================================================
-//
-// IMPORTANT:
-// These functions only make the ELF imports resolve during the static
-// compatibility pass. They are NOT real implementations of the Android,
-// EGL/GLES, Vulkan, or C++ runtime APIs.
-//
-// Do not call them yet. A later step will replace these with real shims.
-//
-extern "C" uintptr_t gn_android_unimplemented(...) {
-    errno = ENOSYS;
-    return 0;
-}
-
-
-// ============================================================================
-// syscall compatibility
-// ============================================================================
-//
-// Linux syscall numbers do not map directly to Horizon.
-// We deliberately do NOT translate them blindly yet.
-//
-// Returning ENOSYS is safer until we know the exact syscall numbers that
-// libwinlator actually invokes.
-//
-// This export exists so that the dynamic symbol is present, but any call to
-// it currently reports "function not implemented".
-//
-
-extern "C" long gn_android_syscall(
-    long /*number*/,
-    ...
-) {
-    errno = ENOSYS;
-    return -1;
-}
-
-
-// ============================================================================
-// epoll compatibility layer
-// ============================================================================
-//
-// First-pass implementation:
-//
-//   epoll_ctl() stores the requested watches.
-//   epoll_wait() translates those watches into poll().
-//   EPOLLET / EPOLLONESHOT semantics are not implemented yet.
-//
-
-extern "C" int gn_android_epoll_create(
-    int size
-) {
-    if (size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    for (int i = 0;
-         i < kMaxEpollInstances;
-         ++i) {
-
-        if (g_epolls[i].used)
+    while (dirent* e = readdir(dir)) {
+        if (e->d_type != DT_REG)
             continue;
 
-        // Use a real descriptor as a unique handle.
-        // The descriptor itself is not used for waiting.
-        const int handle =
-            ::socket(
-                AF_INET,
-                SOCK_STREAM,
-                0
-            );
+        const char* dot = std::strrchr(e->d_name, '.');
 
-        if (handle < 0)
-            return -1;
-
-        g_epolls[i] = {};
-        g_epolls[i].used = true;
-        g_epolls[i].handle_fd = handle;
-
-        return handle;
+        if (dot && std::strcmp(dot, suffix) == 0)
+            ++count;
     }
 
-    errno = EMFILE;
-    return -1;
+    closedir(dir);
+    return count;
 }
 
-extern "C" int gn_android_epoll_ctl(
-    int epfd,
-    int op,
-    int fd,
-    void* event_ptr
-) {
-    EpollInstance* ep =
-        find_epoll(epfd);
+void append_log(const char* message) {
+    FILE* f = std::fopen(kLog, "a");
+    if (!f)
+        return;
 
-    if (!ep || fd < 0) {
-        errno = EBADF;
-        return -1;
-    }
-
-    if (op == GN_EPOLL_CTL_ADD) {
-        if (!event_ptr) {
-            errno = EFAULT;
-            return -1;
-        }
-
-        if (find_watch(ep, fd)) {
-            errno = EEXIST;
-            return -1;
-        }
-
-        EpollWatch* watch =
-            allocate_watch(ep);
-
-        if (!watch) {
-            errno = ENOSPC;
-            return -1;
-        }
-
-        const gn_epoll_event* src =
-            static_cast<const gn_epoll_event*>(
-                event_ptr
-            );
-
-        watch->used = true;
-        watch->fd = fd;
-        watch->events = src->events;
-        watch->user_event = *src;
-
-        return 0;
-    }
-
-    if (op == GN_EPOLL_CTL_MOD) {
-        if (!event_ptr) {
-            errno = EFAULT;
-            return -1;
-        }
-
-        EpollWatch* watch =
-            find_watch(
-                ep,
-                fd
-            );
-
-        if (!watch) {
-            errno = ENOENT;
-            return -1;
-        }
-
-        const gn_epoll_event* src =
-            static_cast<const gn_epoll_event*>(
-                event_ptr
-            );
-
-        watch->events =
-            src->events;
-
-        watch->user_event =
-            *src;
-
-        return 0;
-    }
-
-    if (op == GN_EPOLL_CTL_DEL) {
-        EpollWatch* watch =
-            find_watch(
-                ep,
-                fd
-            );
-
-        if (!watch) {
-            errno = ENOENT;
-            return -1;
-        }
-
-        *watch = {};
-        return 0;
-    }
-
-    errno = EINVAL;
-    return -1;
+    std::fprintf(f, "%s\n", message);
+    std::fclose(f);
 }
 
-extern "C" int gn_android_epoll_wait(
-    int epfd,
-    void* events_ptr,
-    int maxevents,
-    int timeout
-) {
-    if (!events_ptr ||
-        maxevents <= 0) {
+void append_logf(const char* fmt, const char* a) {
+    FILE* f = std::fopen(kLog, "a");
+    if (!f)
+        return;
 
-        errno = EINVAL;
-        return -1;
-    }
+    std::fprintf(f, fmt, a);
+    std::fprintf(f, "\n");
+    std::fclose(f);
+}
 
-    EpollInstance* ep =
-        find_epoll(epfd);
+std::string hex_addr(void* ptr) {
+    char buffer[32];
 
-    if (!ep) {
-        errno = EBADF;
-        return -1;
-    }
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "0x%llx",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(ptr)
+        )
+    );
 
-    pollfd poll_fds[
-        kMaxEpollWatches
-    ];
+    return std::string(buffer);
+}
+constexpr int kMaxMainExports = 512;
 
-    EpollWatch* watch_map[
-        kMaxEpollWatches
-    ];
+static solder_export_t g_main_exports[kMaxMainExports];
+static int g_main_export_count = 0;
 
-    int poll_count = 0;
+bool main_export_exists(const char* name) {
+    if (!name)
+        return false;
 
-    for (int i = 0;
-         i < kMaxEpollWatches;
-         ++i) {
-
-        EpollWatch& watch =
-            ep->watches[i];
-
-        if (!watch.used)
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (!g_main_exports[i].name)
             continue;
 
-        if (poll_count >=
-            kMaxEpollWatches) {
-
-            break;
-        }
-
-        poll_fds[poll_count] = {};
-
-        poll_fds[poll_count].fd =
-            watch.fd;
-
-        poll_fds[poll_count].events =
-            epoll_to_poll_events(
-                watch.events
-            );
-
-        watch_map[poll_count] =
-            &watch;
-
-        ++poll_count;
-    }
-
-    if (poll_count == 0) {
-        return ::poll(
-            nullptr,
-            0,
-            timeout
-        );
-    }
-
-    const int ready =
-        ::poll(
-            poll_fds,
-            static_cast<nfds_t>(
-                poll_count
-            ),
-            timeout
-        );
-
-    if (ready <= 0)
-        return ready;
-
-    gn_epoll_event* out_events =
-        static_cast<gn_epoll_event*>(
-            events_ptr
-        );
-
-    int output_count = 0;
-
-    for (int i = 0;
-         i < poll_count &&
-         output_count < maxevents;
-         ++i) {
-
-        if (!poll_fds[i].revents)
-            continue;
-
-        EpollWatch* watch =
-            watch_map[i];
-
-        gn_epoll_event out =
-            watch->user_event;
-
-        out.events =
-            poll_to_epoll_events(
-                poll_fds[i].revents
-            );
-
-        out_events[
-            output_count
-        ] = out;
-
-        ++output_count;
-    }
-
-    return output_count;
-}
-
-
-// ============================================================================
-// Export table
-// ============================================================================
-
-static const solder_export_t kAndroidCompatExports[] = {
-
-    // Existing socket / filesystem compatibility.
-    SOLDER_EXPORT(
-        "socket",
-        (void*)&gn_android_socket
-    ),
-
-    SOLDER_EXPORT(
-        "bind",
-        (void*)&gn_android_bind
-    ),
-
-    SOLDER_EXPORT(
-        "listen",
-        (void*)&gn_android_listen
-    ),
-
-    SOLDER_EXPORT(
-        "accept",
-        (void*)&gn_android_accept
-    ),
-
-    SOLDER_EXPORT(
-        "poll",
-        (void*)&gn_android_poll
-    ),
-
-    SOLDER_EXPORT(
-        "unlink",
-        (void*)&gn_android_unlink
-    ),
-
-    SOLDER_EXPORT(
-        "ftruncate",
-        (void*)&gn_android_ftruncate
-    ),
-
-    // epoll.
-    SOLDER_EXPORT(
-        "epoll_create",
-        (void*)&gn_android_epoll_create
-    ),
-
-    SOLDER_EXPORT(
-        "epoll_ctl",
-        (void*)&gn_android_epoll_ctl
-    ),
-
-    SOLDER_EXPORT(
-        "epoll_wait",
-        (void*)&gn_android_epoll_wait
-    ),
-
-    // Checked libc functions.
-    SOLDER_EXPORT(
-        "__read_chk",
-        (void*)&gn_android_read_chk
-    ),
-
-    SOLDER_EXPORT(
-        "__write_chk",
-        (void*)&gn_android_write_chk
-    ),
-
-    SOLDER_EXPORT(
-        "__vsprintf_chk",
-        (void*)&gn_android_vsprintf_chk
-    ),
-
-    // libc helpers.
-    SOLDER_EXPORT(
-        "strdup",
-        (void*)&gn_android_strdup
-    ),
-
-    SOLDER_EXPORT(
-        "qsort",
-        (void*)&gn_android_qsort
-    ),
-
-    SOLDER_EXPORT(
-        "fgetws",
-        (void*)&gn_android_fgetws
-    ),
-
-    // Socket message APIs.
-    SOLDER_EXPORT(
-        "sendmsg",
-        (void*)&gn_android_sendmsg
-    ),
-
-    SOLDER_EXPORT(
-        "recvmsg",
-        (void*)&gn_android_recvmsg
-    ),
-
-    SOLDER_EXPORT(
-        "__cmsg_nxthdr",
-        (void*)&gn_android_cmsg_nxthdr
-    ),
-
-    // Linux syscall entry point.
-    SOLDER_EXPORT(
-        "syscall",
-        (void*)&gn_android_syscall
-    ),
-
-
-    // Dynamic loader API used by libwinlator_11.so.
-    SOLDER_EXPORT("dlopen", (void*)&gn_android_dlopen),
-    SOLDER_EXPORT("dlsym", (void*)&gn_android_dlsym),
-    SOLDER_EXPORT("dlclose", (void*)&gn_android_dlclose),
-    SOLDER_EXPORT("dlerror", (void*)&gn_android_dlerror),
-
-    // Additional libc / fortify helpers used by libwinlator_11.so.
-    SOLDER_EXPORT("strtol", (void*)&gn_android_strtol),
-    SOLDER_EXPORT("__strlen_chk", (void*)&gn_android_strlen_chk),
-    SOLDER_EXPORT("__fwrite_chk", (void*)&gn_android_fwrite_chk),
-
-    // pthread entry points used by libwinlator_11.so.
-    SOLDER_EXPORT("pthread_create", (void*)&gn_android_pthread_create),
-    SOLDER_EXPORT("pthread_join", (void*)&gn_android_pthread_join),
-    SOLDER_EXPORT("pthread_self", (void*)&gn_android_pthread_self),
-
-    // ------------------------------------------------------------------------
-    // Resolution-only Android / C++ runtime / graphics placeholders.
-    // ------------------------------------------------------------------------
-    SOLDER_EXPORT("__cxa_finalize", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("__cxa_atexit", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("__register_atfork", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("__stack_chk_fail", (void*)&gn_android_unimplemented),
-
-    SOLDER_EXPORT("AndroidBitmap_getInfo", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AndroidBitmap_lockPixels", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AndroidBitmap_unlockPixels", (void*)&gn_android_unimplemented),
-
-    SOLDER_EXPORT("AHardwareBuffer_getNativeHandle", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AHardwareBuffer_acquire", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AHardwareBuffer_allocate", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AHardwareBuffer_describe", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AHardwareBuffer_unlock", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AHardwareBuffer_release", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("AHardwareBuffer_lock", (void*)&gn_android_unimplemented),
-
-    SOLDER_EXPORT("ASharedMemory_create", (void*)&gn_android_unimplemented),
-
-    SOLDER_EXPORT("eglGetNativeClientBufferANDROID", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("eglGetDisplay", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("eglCreateImageKHR", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("eglDestroyImageKHR", (void*)&gn_android_unimplemented),
-
-    SOLDER_EXPORT("glBindTexture", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("glEGLImageTargetTexture2DOES", (void*)&gn_android_unimplemented),
-
-    SOLDER_EXPORT("vkCreateInstance", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("vkEnumeratePhysicalDevices", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("vkEnumerateDeviceExtensionProperties", (void*)&gn_android_unimplemented),
-};
-
-
-// ============================================================================
-// Public compatibility API
-// ============================================================================
-
-const solder_export_t* android_compat_exports(
-    int* count
-) {
-    if (count) {
-        *count =
-            static_cast<int>(
-                sizeof(kAndroidCompatExports) /
-                sizeof(kAndroidCompatExports[0])
-            );
-    }
-
-    return kAndroidCompatExports;
-}
-
-bool android_compat_has_export(
-    const std::string& name
-) {
-    int count = 0;
-
-    const solder_export_t* exports =
-        android_compat_exports(
-            &count
-        );
-
-    for (int i = 0;
-         i < count;
-         ++i) {
-
-        if (!exports[i].name)
-            continue;
-
-        if (name == exports[i].name)
+        if (std::strcmp(name, g_main_exports[i].name) == 0)
             return true;
     }
 
     return false;
+}
+
+bool has_available_export(const std::string& name) {
+    return main_export_exists(name.c_str());
+}
+
+void draw_header() {
+    std::printf("\x1b[1;1H\x1b[2J");
+
+    std::printf(
+        "============================================================\n"
+    );
+
+    std::printf(
+        "                 GameNative NX 0.2.0                        \n"
+    );
+
+    std::printf(
+        "============================================================\n\n"
+    );
+}
+
+bool init_solder() {
+    const int flags = SOLDER_NO_NRO_EXPORTS;
+
+    if (solder_init(flags) != 0) {
+        append_log("libsolder: initialization failed");
+        return false;
+    }
+
+    // Build ONE export table containing:
+    //   1) libsolder's normal Switch/libc exports
+    //   2) our Android/POSIX compatibility exports
+    //
+    // solder_set_main_exports() turns this table into the main module's
+    // dynamic symbol table. Relocations in loaded DSOs resolve through this
+    // global table.
+    g_main_export_count = 0;
+
+    for (int i = 0;
+         i < solder_num_default_exports &&
+         g_main_export_count < kMaxMainExports;
+         ++i) {
+
+        const solder_export_t& exp =
+            solder_default_exports[i];
+
+        if (!exp.name || !exp.addr_rx)
+            continue;
+
+        if (main_export_exists(exp.name))
+            continue;
+
+        g_main_exports[g_main_export_count++] =
+            exp;
+    }
+
+    int compat_count = 0;
+
+    const solder_export_t* compat_table =
+        android_compat_exports(
+            &compat_count
+        );
+
+    for (int i = 0;
+         i < compat_count &&
+         g_main_export_count < kMaxMainExports;
+         ++i) {
+
+        const solder_export_t& exp =
+            compat_table[i];
+
+        if (!exp.name || !exp.addr_rx)
+            continue;
+
+        // Keep the first definition if a compatibility name happens to
+        // overlap an existing Switch/default export.
+        if (main_export_exists(exp.name))
+            continue;
+
+        g_main_exports[g_main_export_count++] =
+            exp;
+    }
+
+    if (g_main_export_count <= 0) {
+        append_log(
+            "libsolder: combined export table is empty"
+        );
+
+        solder_quit();
+        return false;
+    }
+
+    if (solder_set_main_exports(
+            g_main_exports,
+            g_main_export_count) != 0) {
+
+        append_log(
+            "libsolder: failed to install combined main exports"
+        );
+
+        solder_quit();
+        return false;
+    }
+
+    if (solder_add_search_path(kNativeDir) != 0) {
+        append_log(
+            "libsolder: failed to add native search path"
+        );
+
+        solder_quit();
+        return false;
+    }
+
+    char export_log[96];
+    std::snprintf(
+        export_log,
+        sizeof(export_log),
+        "libsolder: combined main exports installed: %d",
+        g_main_export_count
+    );
+    append_log(export_log);
+
+    append_log("libsolder: initialized");
+    return true;
+}
+
+// Translate an ELF virtual address into a file offset.
+bool va_to_offset(
+    const Elf64_Ehdr& ehdr,
+    const Elf64_Phdr* phdrs,
+    Elf64_Addr va,
+    Elf64_Off& out
+) {
+    for (int i = 0; i < ehdr.e_phnum; ++i) {
+        const Elf64_Phdr& ph = phdrs[i];
+
+        if (ph.p_type != PT_LOAD)
+            continue;
+
+        if (va >= ph.p_vaddr &&
+            va < ph.p_vaddr + ph.p_filesz) {
+
+            out =
+                ph.p_offset +
+                (va - ph.p_vaddr);
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool inspect_needed(
+    const char* path,
+    std::string& result
+) {
+    result.clear();
+
+    FILE* fp = std::fopen(path, "rb");
+
+    if (!fp) {
+        result = "FILE OPEN FAILED";
+        return false;
+    }
+
+    Elf64_Ehdr ehdr{};
+
+    if (std::fread(
+            &ehdr,
+            1,
+            sizeof(ehdr),
+            fp) != sizeof(ehdr)) {
+
+        std::fclose(fp);
+        result = "ELF HEADER READ FAILED";
+        return false;
+    }
+
+    if (ehdr.e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr.e_ident[EI_MAG3] != ELFMAG3) {
+
+        std::fclose(fp);
+        result = "NOT AN ELF FILE";
+        return false;
+    }
+
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        std::fclose(fp);
+        result = "NOT ELF64";
+        return false;
+    }
+
+    if (ehdr.e_machine != EM_AARCH64) {
+        std::fclose(fp);
+        result = "NOT AARCH64";
+        return false;
+    }
+
+    if (ehdr.e_phnum == 0) {
+        std::fclose(fp);
+        result = "NO PROGRAM HEADERS";
+        return false;
+    }
+
+    Elf64_Phdr* phdrs =
+        new Elf64_Phdr[ehdr.e_phnum];
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(ehdr.e_phoff),
+            SEEK_SET) != 0) {
+
+        delete[] phdrs;
+        std::fclose(fp);
+        result = "PROGRAM HEADER SEEK FAILED";
+        return false;
+    }
+
+    if (std::fread(
+            phdrs,
+            sizeof(Elf64_Phdr),
+            ehdr.e_phnum,
+            fp) != ehdr.e_phnum) {
+
+        delete[] phdrs;
+        std::fclose(fp);
+        result = "PROGRAM HEADER READ FAILED";
+        return false;
+    }
+
+    Elf64_Dyn* dynamic = nullptr;
+    size_t dynamic_count = 0;
+
+    for (int i = 0; i < ehdr.e_phnum; ++i) {
+        if (phdrs[i].p_type != PT_DYNAMIC)
+            continue;
+
+        dynamic_count =
+            phdrs[i].p_filesz / sizeof(Elf64_Dyn);
+
+        if (dynamic_count == 0)
+            break;
+
+        dynamic =
+            new Elf64_Dyn[dynamic_count];
+
+        if (std::fseek(
+                fp,
+                static_cast<long>(phdrs[i].p_offset),
+                SEEK_SET) != 0) {
+
+            delete[] dynamic;
+            delete[] phdrs;
+            std::fclose(fp);
+
+            result =
+                "DYNAMIC SECTION SEEK FAILED";
+
+            return false;
+        }
+
+        if (std::fread(
+                dynamic,
+                sizeof(Elf64_Dyn),
+                dynamic_count,
+                fp) != dynamic_count) {
+
+            delete[] dynamic;
+            delete[] phdrs;
+            std::fclose(fp);
+
+            result =
+                "DYNAMIC SECTION READ FAILED";
+
+            return false;
+        }
+
+        break;
+    }
+
+    if (!dynamic) {
+        delete[] phdrs;
+        std::fclose(fp);
+
+        result = "NO PT_DYNAMIC";
+        return false;
+    }
+
+    Elf64_Addr strtab_va = 0;
+    size_t needed_count = 0;
+
+    for (size_t i = 0; i < dynamic_count; ++i) {
+        if (dynamic[i].d_tag == DT_STRTAB) {
+            strtab_va =
+                dynamic[i].d_un.d_ptr;
+        }
+        else if (dynamic[i].d_tag == DT_NEEDED) {
+            ++needed_count;
+        }
+    }
+
+    if (!strtab_va) {
+        delete[] dynamic;
+        delete[] phdrs;
+        std::fclose(fp);
+
+        result = "DT_STRTAB NOT FOUND";
+        return false;
+    }
+
+    Elf64_Off strtab_offset = 0;
+
+    if (!va_to_offset(
+            ehdr,
+            phdrs,
+            strtab_va,
+            strtab_offset)) {
+
+        delete[] dynamic;
+        delete[] phdrs;
+        std::fclose(fp);
+
+        result =
+            "CANNOT MAP DT_STRTAB";
+
+        return false;
+    }
+
+    result +=
+        "DT_NEEDED (" +
+        std::to_string(needed_count) +
+        "):\n";
+
+    for (size_t i = 0;
+         i < dynamic_count;
+         ++i) {
+
+        if (dynamic[i].d_tag != DT_NEEDED)
+            continue;
+
+        Elf64_Off name_offset =
+            strtab_offset +
+            dynamic[i].d_un.d_val;
+
+        if (std::fseek(
+                fp,
+                static_cast<long>(name_offset),
+                SEEK_SET) != 0) {
+
+            result += "  <seek failed>\n";
+            continue;
+        }
+
+        std::string name;
+        char c = 0;
+
+        while (
+            name.size() < 1024 &&
+            std::fread(&c, 1, 1, fp) == 1 &&
+            c != '\0') {
+
+            name += c;
+        }
+
+        result += "  ";
+
+        if (name.empty())
+            result += "<empty>";
+        else
+            result += name;
+
+        result += "\n";
+    }
+
+    delete[] dynamic;
+    delete[] phdrs;
+    std::fclose(fp);
+
+    return true;
+}
+
+bool get_dynamic_info(
+    FILE* fp,
+    const Elf64_Ehdr& ehdr,
+    const Elf64_Phdr* phdrs,
+    Elf64_Addr& symtab_va,
+    Elf64_Addr& strtab_va,
+    Elf64_Addr& hash_va,
+    Elf64_Addr& gnu_hash_va,
+    Elf64_Xword& syment,
+    Elf64_Xword& strsz
+) {
+    symtab_va = 0;
+    strtab_va = 0;
+    hash_va = 0;
+    gnu_hash_va = 0;
+    syment = 0;
+    strsz = 0;
+
+    Elf64_Phdr dynamic_ph{};
+
+    bool found_dynamic = false;
+
+    for (int i = 0; i < ehdr.e_phnum; ++i) {
+        if (phdrs[i].p_type == PT_DYNAMIC) {
+            dynamic_ph = phdrs[i];
+            found_dynamic = true;
+            break;
+        }
+    }
+
+    if (!found_dynamic)
+        return false;
+
+    const size_t dynamic_count =
+        dynamic_ph.p_filesz / sizeof(Elf64_Dyn);
+
+    if (dynamic_count == 0)
+        return false;
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(dynamic_ph.p_offset),
+            SEEK_SET) != 0) {
+
+        return false;
+    }
+
+    for (size_t i = 0;
+         i < dynamic_count;
+         ++i) {
+
+        Elf64_Dyn d{};
+
+        if (std::fread(
+                &d,
+                sizeof(d),
+                1,
+                fp) != 1) {
+
+            return false;
+        }
+
+        switch (d.d_tag) {
+            case DT_SYMTAB:
+                symtab_va = d.d_un.d_ptr;
+                break;
+
+            case DT_STRTAB:
+                strtab_va = d.d_un.d_ptr;
+                break;
+
+            case DT_HASH:
+                hash_va = d.d_un.d_ptr;
+                break;
+
+            case DT_GNU_HASH:
+                gnu_hash_va = d.d_un.d_ptr;
+                break;
+
+            case DT_SYMENT:
+                syment = d.d_un.d_val;
+                break;
+
+            case DT_STRSZ:
+                strsz = d.d_un.d_val;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    return
+        symtab_va != 0 &&
+        strtab_va != 0 &&
+        syment != 0;
+}
+
+bool get_sysv_hash_count(
+    FILE* fp,
+    const Elf64_Ehdr& ehdr,
+    const Elf64_Phdr* phdrs,
+    Elf64_Addr hash_va,
+    size_t& count
+) {
+    count = 0;
+
+    if (!hash_va)
+        return false;
+
+    Elf64_Off hash_offset = 0;
+
+    if (!va_to_offset(
+            ehdr,
+            phdrs,
+            hash_va,
+            hash_offset)) {
+
+        return false;
+    }
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(hash_offset),
+            SEEK_SET) != 0) {
+
+        return false;
+    }
+
+    uint32_t nbucket = 0;
+    uint32_t nchain = 0;
+
+    if (std::fread(&nbucket, sizeof(nbucket), 1, fp) != 1 ||
+        std::fread(&nchain, sizeof(nchain), 1, fp) != 1) {
+
+        return false;
+    }
+
+    if (nbucket == 0 || nchain == 0)
+        return false;
+
+    count = nchain;
+    return true;
+}
+
+bool get_gnu_hash_count(
+    FILE* fp,
+    const Elf64_Ehdr& ehdr,
+    const Elf64_Phdr* phdrs,
+    Elf64_Addr gnu_hash_va,
+    size_t& count
+) {
+    count = 0;
+
+    if (!gnu_hash_va)
+        return false;
+
+    Elf64_Off hash_offset = 0;
+
+    if (!va_to_offset(
+            ehdr,
+            phdrs,
+            gnu_hash_va,
+            hash_offset)) {
+
+        return false;
+    }
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(hash_offset),
+            SEEK_SET) != 0) {
+
+        return false;
+    }
+
+    uint32_t nbuckets = 0;
+    uint32_t symoffset = 0;
+    uint32_t bloom_size = 0;
+    uint32_t bloom_shift = 0;
+
+    if (std::fread(&nbuckets, sizeof(nbuckets), 1, fp) != 1 ||
+        std::fread(&symoffset, sizeof(symoffset), 1, fp) != 1 ||
+        std::fread(&bloom_size, sizeof(bloom_size), 1, fp) != 1 ||
+        std::fread(&bloom_shift, sizeof(bloom_shift), 1, fp) != 1) {
+
+        return false;
+    }
+
+    (void)bloom_shift;
+
+    if (nbuckets == 0 || bloom_size == 0)
+        return false;
+
+    // GNU hash bloom filter is 64-bit on ELF64.
+    const Elf64_Off buckets_offset =
+        hash_offset +
+        16 +
+        static_cast<Elf64_Off>(bloom_size) * 8;
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(buckets_offset),
+            SEEK_SET) != 0) {
+
+        return false;
+    }
+
+    uint32_t max_symbol = 0;
+
+    for (uint32_t i = 0;
+         i < nbuckets;
+         ++i) {
+
+        uint32_t bucket = 0;
+
+        if (std::fread(
+                &bucket,
+                sizeof(bucket),
+                1,
+                fp) != 1) {
+
+            return false;
+        }
+
+        if (bucket < symoffset)
+            continue;
+
+        if (bucket > max_symbol)
+            max_symbol = bucket;
+    }
+
+    if (max_symbol < symoffset)
+        return true;
+
+    const Elf64_Off chain_offset =
+        buckets_offset +
+        static_cast<Elf64_Off>(nbuckets) * 4 +
+        static_cast<Elf64_Off>(max_symbol - symoffset) * 4;
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(chain_offset),
+            SEEK_SET) != 0) {
+
+        return false;
+    }
+
+    uint32_t index = max_symbol;
+
+    for (;;) {
+        uint32_t chain = 0;
+
+        if (std::fread(
+                &chain,
+                sizeof(chain),
+                1,
+                fp) != 1) {
+
+            return false;
+        }
+
+        if (index == UINT32_MAX)
+            return false;
+
+        ++index;
+
+        if (chain & 1u)
+            break;
+    }
+
+    count = index;
+    return true;
+}
+
+bool get_section_dynsym_count(
+    FILE* fp,
+    const Elf64_Ehdr& ehdr,
+    size_t& count
+) {
+    count = 0;
+
+    if (ehdr.e_shoff == 0 ||
+        ehdr.e_shnum == 0 ||
+        ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
+
+        return false;
+    }
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(ehdr.e_shoff),
+            SEEK_SET) != 0) {
+
+        return false;
+    }
+
+    for (uint16_t i = 0;
+         i < ehdr.e_shnum;
+         ++i) {
+
+        Elf64_Shdr sh{};
+
+        if (std::fread(
+                &sh,
+                sizeof(sh),
+                1,
+                fp) != 1) {
+
+            return false;
+        }
+
+        if (sh.sh_type == SHT_DYNSYM &&
+            sh.sh_entsize != 0) {
+
+            count =
+                static_cast<size_t>(
+                    sh.sh_size / sh.sh_entsize
+                );
+
+            return count != 0;
+        }
+    }
+
+    return false;
+}
+
+bool inspect_undefined_symbols(
+    const char* path,
+    std::string& screen_result,
+    std::string& full_result
+) {
+    screen_result.clear();
+    full_result.clear();
+
+    FILE* fp = std::fopen(path, "rb");
+
+    if (!fp) {
+        screen_result = "SYMBOL FILE OPEN FAILED";
+        full_result = screen_result;
+        return false;
+    }
+
+    Elf64_Ehdr ehdr{};
+
+    if (std::fread(
+            &ehdr,
+            1,
+            sizeof(ehdr),
+            fp) != sizeof(ehdr)) {
+
+        std::fclose(fp);
+        screen_result = "SYMBOL ELF HEADER READ FAILED";
+        full_result = screen_result;
+        return false;
+    }
+
+    if (ehdr.e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr.e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr.e_ident[EI_MAG3] != ELFMAG3 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_machine != EM_AARCH64) {
+
+        std::fclose(fp);
+        screen_result = "SYMBOL ELF FORMAT INVALID";
+        full_result = screen_result;
+        return false;
+    }
+
+    if (ehdr.e_phnum == 0) {
+        std::fclose(fp);
+        screen_result = "SYMBOL ELF HAS NO PROGRAM HEADERS";
+        full_result = screen_result;
+        return false;
+    }
+
+    Elf64_Phdr* phdrs =
+        new Elf64_Phdr[ehdr.e_phnum];
+
+    if (std::fseek(
+            fp,
+            static_cast<long>(ehdr.e_phoff),
+            SEEK_SET) != 0 ||
+        std::fread(
+            phdrs,
+            sizeof(Elf64_Phdr),
+            ehdr.e_phnum,
+            fp) != ehdr.e_phnum) {
+
+        delete[] phdrs;
+        std::fclose(fp);
+
+        screen_result =
+            "SYMBOL PROGRAM HEADER READ FAILED";
+
+        full_result = screen_result;
+        return false;
+    }
+
+    Elf64_Addr symtab_va = 0;
+    Elf64_Addr strtab_va = 0;
+    Elf64_Addr hash_va = 0;
+    Elf64_Addr gnu_hash_va = 0;
+    Elf64_Xword syment = 0;
+    Elf64_Xword strsz = 0;
+
+    if (!get_dynamic_info(
+            fp,
+            ehdr,
+            phdrs,
+            symtab_va,
+            strtab_va,
+            hash_va,
+            gnu_hash_va,
+            syment,
+            strsz)) {
+
+        delete[] phdrs;
+        std::fclose(fp);
+
+        screen_result =
+            "DYNAMIC SYMBOL INFO NOT FOUND";
+
+        full_result = screen_result;
+        return false;
+    }
+
+    if (syment != sizeof(Elf64_Sym)) {
+        delete[] phdrs;
+        std::fclose(fp);
+
+        screen_result =
+            "UNEXPECTED DT_SYMENT";
+
+        full_result = screen_result;
+        return false;
+    }
+
+    Elf64_Off symtab_offset = 0;
+    Elf64_Off strtab_offset = 0;
+
+    if (!va_to_offset(
+            ehdr,
+            phdrs,
+            symtab_va,
+            symtab_offset)) {
+
+        delete[] phdrs;
+        std::fclose(fp);
+
+        screen_result =
+            "CANNOT MAP DT_SYMTAB";
+
+        full_result = screen_result;
+        return false;
+    }
+
+    if (!va_to_offset(
+            ehdr,
+            phdrs,
+            strtab_va,
+            strtab_offset)) {
+
+        delete[] phdrs;
+        std::fclose(fp);
+
+        screen_result =
+            "CANNOT MAP DT_STRTAB";
+
+        full_result = screen_result;
+        return false;
+    }
+
+    // Determine dynamic-symbol count.
+    size_t symbol_count = 0;
+
+    if (!get_sysv_hash_count(
+            fp,
+            ehdr,
+            phdrs,
+            hash_va,
+            symbol_count)) {
+
+        get_gnu_hash_count(
+            fp,
+            ehdr,
+            phdrs,
+            gnu_hash_va,
+            symbol_count
+        );
+    }
+
+    if (symbol_count == 0) {
+        get_section_dynsym_count(
+            fp,
+            ehdr,
+            symbol_count
+        );
+    }
+
+    if (symbol_count == 0) {
+        delete[] phdrs;
+        std::fclose(fp);
+
+        screen_result =
+            "CANNOT DETERMINE DYNSYM COUNT";
+
+        full_result = screen_result;
+        return false;
+    }
+
+    size_t undefined_count = 0;
+    size_t shown_count = 0;
+
+    full_result =
+        "DYNSYM COUNT: " +
+        std::to_string(symbol_count) +
+        "\n";
+
+    full_result +=
+        "UNDEFINED SYMBOLS:\n";
+
+    screen_result =
+        "DYNSYM COUNT: " +
+        std::to_string(symbol_count) +
+        "\n";
+
+    screen_result +=
+        "UNDEFINED SYMBOLS:\n";
+
+    for (size_t i = 0;
+         i < symbol_count;
+         ++i) {
+
+        const Elf64_Off symbol_offset =
+            symtab_offset +
+            static_cast<Elf64_Off>(i) *
+                sizeof(Elf64_Sym);
+
+        if (std::fseek(
+                fp,
+                static_cast<long>(symbol_offset),
+                SEEK_SET) != 0) {
+
+            break;
+        }
+
+        Elf64_Sym sym{};
+
+        if (std::fread(
+                &sym,
+                sizeof(sym),
+                1,
+                fp) != 1) {
+
+            break;
+        }
+
+        if (sym.st_shndx != SHN_UNDEF)
+            continue;
+
+        const uint32_t name_offset =
+            sym.st_name;
+
+        if (name_offset >= strsz &&
+            strsz != 0) {
+
+            continue;
+        }
+
+        if (std::fseek(
+                fp,
+                static_cast<long>(
+                    strtab_offset + name_offset
+                ),
+                SEEK_SET) != 0) {
+
+            continue;
+        }
+
+        std::string name;
+        char c = 0;
+
+        while (
+            name.size() < 1024 &&
+            std::fread(&c, 1, 1, fp) == 1 &&
+            c != '\0') {
+
+            name += c;
+        }
+
+        if (name.empty())
+            continue;
+
+        ++undefined_count;
+
+        const unsigned bind =
+            ELF64_ST_BIND(sym.st_info);
+
+        const char* bind_name = "OTHER";
+
+        if (bind == STB_GLOBAL)
+            bind_name = "GLOBAL";
+        else if (bind == STB_WEAK)
+            bind_name = "WEAK";
+const bool provided =
+    has_available_export(name);
+
+std::string line =
+    "  [" +
+    std::string(bind_name) +
+    "] " +
+    name +
+    "    ";
+
+if (provided)
+    line += "DEFAULT";
+else
+    line += "MISSING";
+
+line += "\n";
+
+        full_result += line;
+
+        if (shown_count < kScreenSymbolLimit) {
+            screen_result += line;
+            ++shown_count;
+        }
+    }
+
+    if (undefined_count > kScreenSymbolLimit) {
+        screen_result +=
+            "  ... ";
+        screen_result +=
+            std::to_string(
+                undefined_count -
+                kScreenSymbolLimit
+            );
+        screen_result +=
+            " more in debug.log\n";
+    }
+
+    screen_result =
+        "UNDEFINED COUNT: " +
+        std::to_string(undefined_count) +
+        "\n" +
+        screen_result;
+
+    full_result =
+        "UNDEFINED COUNT: " +
+        std::to_string(undefined_count) +
+        "\n" +
+        full_result;
+
+    delete[] phdrs;
+    std::fclose(fp);
+
+    return true;
+}
+
+void probe_winlator(std::string& result) {
+    result.clear();
+
+    std::printf(
+        "\nProbing libwinlator.so...\n"
+    );
+
+    consoleUpdate(nullptr);
+
+    // IMPORTANT:
+    // Keep this probe lazy and do not recursively load dependencies.
+    const int flags =
+        SOLDER_LAZY |
+        SOLDER_NO_AUTOLOAD;
+
+    void* handle =
+        solder_dlopen(
+            "libwinlator.so",
+            flags
+        );
+
+    const char* err =
+        solder_dlerror();
+
+    if (!handle) {
+        result =
+            "LOAD FAILED\n";
+
+        result +=
+            err
+                ? err
+                : "(no error text)";
+
+        append_logf(
+            "libwinlator.so probe failed: %s",
+            err
+                ? err
+                : "(no error text)"
+        );
+
+        return;
+    }
+
+    void* base =
+        solder_get_base_addr(handle);
+
+    void* text =
+        solder_get_text_addr(handle);
+
+    result +=
+        "ELF LOAD OK\n";
+
+    result +=
+        "base: " +
+        hex_addr(base) +
+        "\n";
+
+    result +=
+        "text: " +
+        hex_addr(text) +
+        "\n\n";
+
+    // ------------------------------------------------------------
+    // DT_NEEDED
+    // ------------------------------------------------------------
+
+    std::string needed;
+
+    const bool needed_ok =
+        inspect_needed(
+            "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator.so",
+            needed
+        );
+
+    if (needed_ok) {
+        result += needed;
+
+        append_log(
+            "libwinlator.so dependencies:"
+        );
+
+        append_log(
+            needed.c_str()
+        );
+    }
+    else {
+        result +=
+            "DEPENDENCY INSPECTION FAILED\n";
+
+        result += needed;
+
+        append_logf(
+            "libwinlator.so dependency inspection failed: %s",
+            needed.c_str()
+        );
+    }
+
+    // ------------------------------------------------------------
+    // STATIC UNDEFINED SYMBOL INSPECTION
+    // ------------------------------------------------------------
+
+    result += "\n";
+    result +=
+        "STATIC SYMBOL INSPECTION:\n";
+
+    std::string symbol_screen;
+    std::string symbol_full;
+
+    const bool symbols_ok =
+        inspect_undefined_symbols(
+            "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator.so",
+            symbol_screen,
+            symbol_full
+        );
+
+    if (symbols_ok) {
+        result += symbol_screen;
+
+        append_log(
+            "libwinlator.so static undefined symbols:"
+        );
+
+        append_log(
+            symbol_full.c_str()
+        );
+    }
+    else {
+        result += symbol_screen;
+
+        append_log(
+            "libwinlator.so static symbol inspection failed:"
+        );
+
+        append_log(
+            symbol_full.c_str()
+        );
+    }
+
+    append_log(
+        "libwinlator.so probe: "
+        "ELF load succeeded (lazy/no-autoload)"
+    );
+
+    // ------------------------------------------------------------
+    // CONTROLLED REAL RELOCATION TEST
+    // ------------------------------------------------------------
+    //
+    // solder_dlsym() on a lazy module forces libsolder to relocate the
+    // object and run its initialization code. We deliberately do NOT
+    // call the returned function. The exported symbol below is a real
+    // function from libwinlator.so and is only used as the trigger.
+    //
+    append_log(
+        "libwinlator.so relocation test: "
+        "calling solder_dlsym(createMemoryFd)"
+    );
+
+    result +=
+        "\nRELOCATION TEST: createMemoryFd\n";
+
+    void* resolved =
+        solder_dlsym(
+            handle,
+            "createMemoryFd"
+        );
+
+    const char* dlsym_err =
+        solder_dlerror();
+
+    if (resolved) {
+        const std::string resolved_text =
+            hex_addr(resolved);
+
+        result +=
+            "dlsym: SUCCESS\n";
+
+        result +=
+            "address: " +
+            resolved_text +
+            "\n";
+
+        append_logf(
+            "libwinlator.so relocation test: "
+            "SUCCESS, createMemoryFd=%s",
+            resolved_text.c_str()
+        );
+
+        // Keep the relocated module alive for this diagnostic run.
+        // We intentionally do not dlclose() it immediately, so a
+        // successful relocation is not mixed with destructor/fini code.
+        return;
+    }
+
+    result +=
+        "dlsym: FAILED\n";
+
+    result +=
+        "error: ";
+
+    result +=
+        dlsym_err
+            ? dlsym_err
+            : "(no error text)";
+
+    result += "\n";
+
+    append_logf(
+        "libwinlator.so relocation test: FAILED: %s",
+        dlsym_err
+            ? dlsym_err
+            : "(no error text)"
+    );
+
+    // Return to the previously stable state after a clean failure.
+    solder_dlclose(handle);
+
+    const char* close_err =
+        solder_dlerror();
+
+    if (close_err) {
+        result +=
+            "\nclose: ";
+
+        result += close_err;
+
+        append_logf(
+            "libwinlator.so close: %s",
+            close_err
+        );
+    }
+}
+
+
+void probe_winlator_11(std::string& result) {
+    result += "\n\n================ LIBWINLATOR_11 ================\n";
+
+    append_log("libwinlator_11.so probe: starting");
+
+    const int flags =
+        SOLDER_LAZY |
+        SOLDER_NO_AUTOLOAD;
+
+    void* handle =
+        solder_dlopen(
+            "libwinlator_11.so",
+            flags
+        );
+
+    const char* err = solder_dlerror();
+
+    if (!handle) {
+        result += "LOAD FAILED\n";
+        result += err ? err : "(no error text)";
+        result += "\n";
+
+        append_logf(
+            "libwinlator_11.so probe failed: %s",
+            err ? err : "(no error text)"
+        );
+        return;
+    }
+
+    result += "ELF LOAD OK\n";
+    result +=
+        "base: " +
+        hex_addr(solder_get_base_addr(handle)) +
+        "\n";
+    result +=
+        "text: " +
+        hex_addr(solder_get_text_addr(handle)) +
+        "\n\n";
+
+    std::string needed;
+    const bool needed_ok = inspect_needed(
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator_11.so",
+        needed
+    );
+
+    if (needed_ok) {
+        result += needed;
+        append_log("libwinlator_11.so dependencies:");
+        append_log(needed.c_str());
+    } else {
+        result += "DEPENDENCY INSPECTION FAILED\n";
+        result += needed;
+        append_logf(
+            "libwinlator_11.so dependency inspection failed: %s",
+            needed.c_str()
+        );
+    }
+
+    std::string symbol_screen;
+    std::string symbol_full;
+
+    const bool symbols_ok = inspect_undefined_symbols(
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator_11.so",
+        symbol_screen,
+        symbol_full
+    );
+
+    result += "\nSTATIC SYMBOL INSPECTION:\n";
+    result += symbol_screen;
+
+    append_log("libwinlator_11.so static undefined symbols:");
+    append_log(symbol_full.c_str());
+
+    append_log(
+        "libwinlator_11.so probe: "
+        "ELF load succeeded (lazy/no-autoload)"
+    );
+
+    result += "\nRELOCATION TEST: createMemoryFd\n";
+    append_log(
+        "libwinlator_11.so relocation test: "
+        "calling solder_dlsym(createMemoryFd)"
+    );
+
+    void* resolved = solder_dlsym(
+        handle,
+        "createMemoryFd"
+    );
+
+    const char* dlsym_err = solder_dlerror();
+
+    if (resolved) {
+        const std::string resolved_text = hex_addr(resolved);
+
+        result += "dlsym: SUCCESS\n";
+        result += "address: " + resolved_text + "\n";
+
+        append_logf(
+            "libwinlator_11.so relocation test: "
+            "SUCCESS, createMemoryFd=%s",
+            resolved_text.c_str()
+        );
+
+        // Keep the relocated module alive for diagnostics.
+        return;
+    }
+
+    result += "dlsym: FAILED\n";
+    result += "error: ";
+    result += dlsym_err ? dlsym_err : "(no error text)";
+    result += "\n";
+
+    append_logf(
+        "libwinlator_11.so relocation test: FAILED: %s",
+        dlsym_err ? dlsym_err : "(no error text)"
+    );
+
+    solder_dlclose(handle);
+}
+
+} // namespace
+
+int main(int /*argc*/, char** /*argv*/) {
+    consoleInit(nullptr);
+    socketInitializeDefault();
+
+    mkdir(kRoot, 0777);
+
+    append_log(
+        "GameNative NX 0.2.0 started"
+    );
+
+    const bool solder_ok =
+        init_solder();
+
+    PadState pad;
+
+    padConfigureInput(
+        1,
+        HidNpadStyleSet_NpadStandard
+    );
+
+    padInitializeDefault(&pad);
+
+    bool probed = false;
+    std::string probe_result;
+
+    while (appletMainLoop()) {
+        draw_header();
+
+        std::printf(
+            "This build adds the FIRST REAL loader stage.\n"
+        );
+
+        std::printf(
+            "It uses libsolder to inspect the original "
+            "Android ARM64 .so.\n\n"
+        );
+
+        std::printf(
+            "[1] Project root     : %s\n",
+            exists(kRoot)
+                ? "FOUND"
+                : "MISSING"
+        );
+
+        std::printf(
+            "[2] ARM64 native dir : %s\n",
+            exists(kNativeDir)
+                ? "FOUND"
+                : "MISSING"
+        );
+
+        std::printf(
+            "[3] Runtime dir      : %s\n",
+            exists(kRuntimeDir)
+                ? "FOUND"
+                : "MISSING"
+        );
+
+        std::printf(
+            "[4] Games dir        : %s\n",
+            exists(kGamesDir)
+                ? "FOUND"
+                : "MISSING"
+        );
+
+        std::printf(
+            "[5] Android .so      : %zu file(s)\n",
+            count_entries(
+                kNativeDir,
+                ".so"
+            )
+        );
+
+        std::printf(
+            "[6] libsolder        : %s\n",
+            solder_ok
+                ? "READY"
+                : "FAILED"
+        );
+
+        std::printf(
+            "\n------------------------------------------------------------\n"
+        );
+
+        std::printf(
+            "Controls:\n"
+        );
+
+        std::printf(
+            "  A      Inspect libwinlator.so + libwinlator_11.so\n"
+        );
+
+        std::printf(
+            "  +      Exit\n"
+        );
+
+        std::printf(
+            "------------------------------------------------------------\n"
+        );
+
+        if (solder_ok && !probed) {
+            std::printf(
+                "\nPut libwinlator.so in:\n%s\n",
+                kNativeDir
+            );
+
+            std::printf(
+                "then press A.\n"
+            );
+        }
+
+        if (probed) {
+            std::printf(
+                "\n============================================================\n"
+            );
+
+            std::printf(
+                "                    PROBE RESULT\n"
+            );
+
+            std::printf(
+                "============================================================\n"
+            );
+
+            std::printf(
+                "%s\n",
+                probe_result.c_str()
+            );
+        }
+
+        consoleUpdate(nullptr);
+
+        padUpdate(&pad);
+
+        const u64 buttons =
+            padGetButtonsDown(&pad);
+
+        if ((buttons & HidNpadButton_Plus) != 0)
+            break;
+
+        if ((buttons & HidNpadButton_A) != 0 &&
+            solder_ok &&
+            !probed) {
+
+            probe_winlator(probe_result);
+            probe_winlator_11(probe_result);
+            probed = true;
+        }
+
+        svcSleepThread(
+            16'000'000ULL
+        );
+    }
+
+    if (solder_ok)
+        solder_quit();
+
+    socketExit();
+    consoleExit(nullptr);
+
+    return 0;
 }
