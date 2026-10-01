@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -230,17 +231,25 @@ extern "C" int gn_android_ftruncate(
 // New libc / POSIX compatibility functions
 // ============================================================================
 
+extern "C" ssize_t gn_android_eventfd_read(
+    int fd,
+    void* buf,
+    size_t count
+);
+
+extern "C" ssize_t gn_android_eventfd_write(
+    int fd,
+    const void* buf,
+    size_t count
+);
+
 extern "C" ssize_t gn_android_read_chk(
     int fd,
     void* buf,
     size_t count,
     size_t /*buflen*/
 ) {
-    return ::read(
-        fd,
-        buf,
-        count
-    );
+    return gn_android_eventfd_read(fd, buf, count);
 }
 
 extern "C" ssize_t gn_android_write_chk(
@@ -249,11 +258,7 @@ extern "C" ssize_t gn_android_write_chk(
     size_t count,
     size_t /*buflen*/
 ) {
-    return ::write(
-        fd,
-        buf,
-        count
-    );
+    return gn_android_eventfd_write(fd, buf, count);
 }
 
 extern "C" int gn_android_vsprintf_chk(
@@ -408,11 +413,14 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 
 
 // ============================================================================
-// mmap / munmap / eventfd compatibility placeholders
+// mmap / munmap / eventfd compatibility
 // ============================================================================
 //
-// These are currently resolution-safe shims so Android/Bionic imports can be
-// relocated by libsolder. They are not full Linux/Horizon implementations yet.
+// mmap/munmap are still resolution-only placeholders. eventfd gets a small
+// functional compatibility layer backed by a pipe. The read end is returned
+// to Android code, while writes are redirected to the hidden write end. This
+// is enough to provide an fd that participates in poll/epoll and can be
+// cleaned up without leaking the paired descriptor.
 
 extern "C" void* gn_android_mmap(
     void* /*addr*/,
@@ -434,12 +442,128 @@ extern "C" int gn_android_munmap(
     return -1;
 }
 
+constexpr size_t kMaxEventFdShims = 16;
+constexpr int kAndroidEfdNonblock = 0x00000800;
+
+struct EventFdShim {
+    int read_fd = -1;
+    int write_fd = -1;
+};
+
+static EventFdShim g_eventfd_shims[kMaxEventFdShims];
+
+EventFdShim* find_eventfd_shim(int fd) {
+    for (size_t i = 0; i < kMaxEventFdShims; ++i) {
+        if (g_eventfd_shims[i].read_fd == fd)
+            return &g_eventfd_shims[i];
+    }
+
+    return nullptr;
+}
+
+EventFdShim* allocate_eventfd_shim() {
+    for (size_t i = 0; i < kMaxEventFdShims; ++i) {
+        if (g_eventfd_shims[i].read_fd < 0 &&
+            g_eventfd_shims[i].write_fd < 0) {
+            return &g_eventfd_shims[i];
+        }
+    }
+
+    return nullptr;
+}
+
 extern "C" int gn_android_eventfd(
-    unsigned int /*initval*/,
-    int /*flags*/
+    unsigned int initval,
+    int flags
 ) {
-    errno = ENOSYS;
-    return -1;
+    int pipe_fds[2] = {-1, -1};
+
+    if (::pipe(pipe_fds) != 0)
+        return -1;
+
+    if (flags & kAndroidEfdNonblock) {
+        const int read_flags = ::fcntl(pipe_fds[0], F_GETFL, 0);
+        const int write_flags = ::fcntl(pipe_fds[1], F_GETFL, 0);
+
+        if (read_flags < 0 || write_flags < 0 ||
+            ::fcntl(pipe_fds[0], F_SETFL, read_flags | O_NONBLOCK) != 0 ||
+            ::fcntl(pipe_fds[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
+            ::close(pipe_fds[0]);
+            ::close(pipe_fds[1]);
+            return -1;
+        }
+    }
+
+    EventFdShim* shim = allocate_eventfd_shim();
+    if (!shim) {
+        ::close(pipe_fds[0]);
+        ::close(pipe_fds[1]);
+        errno = EMFILE;
+        return -1;
+    }
+
+    shim->read_fd = pipe_fds[0];
+    shim->write_fd = pipe_fds[1];
+
+    if (initval != 0) {
+        const uint64_t value = initval;
+        if (::write(shim->write_fd, &value, sizeof(value)) !=
+            static_cast<ssize_t>(sizeof(value))) {
+            ::close(shim->read_fd);
+            ::close(shim->write_fd);
+            shim->read_fd = -1;
+            shim->write_fd = -1;
+            return -1;
+        }
+    }
+
+    return shim->read_fd;
+}
+
+extern "C" ssize_t gn_android_eventfd_read(
+    int fd,
+    void* buf,
+    size_t count
+) {
+    EventFdShim* shim = find_eventfd_shim(fd);
+    if (!shim)
+        return ::read(fd, buf, count);
+
+    return ::read(shim->read_fd, buf, count);
+}
+
+extern "C" ssize_t gn_android_eventfd_write(
+    int fd,
+    const void* buf,
+    size_t count
+) {
+    EventFdShim* shim = find_eventfd_shim(fd);
+    if (!shim)
+        return ::write(fd, buf, count);
+
+    return ::write(shim->write_fd, buf, count);
+}
+
+extern "C" int gn_android_close(
+    int fd
+) {
+    EventFdShim* shim = find_eventfd_shim(fd);
+    if (!shim)
+        return ::close(fd);
+
+    const int read_fd = shim->read_fd;
+    const int write_fd = shim->write_fd;
+
+    shim->read_fd = -1;
+    shim->write_fd = -1;
+
+    const int read_rc = ::close(read_fd);
+    const int write_rc = ::close(write_fd);
+
+    if (read_rc != 0)
+        return read_rc;
+
+    return write_rc;
 }
 
 
@@ -949,6 +1073,11 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT(
         "poll",
         (void*)&gn_android_poll
+    ),
+
+    SOLDER_EXPORT(
+        "close",
+        (void*)&gn_android_close
     ),
 
     SOLDER_EXPORT(
