@@ -1586,17 +1586,17 @@ void probe_xconnector(std::string& result) {
 
     result +=
         "\nRELOCATION TEST: "
-        "Java_com_winlator_xconnector_XConnectorEpoll_createEpollFd\n";
+        "Java_com_winlator_xconnector_XConnectorEpollNative_createEpollFd\n";
 
     append_log(
         "libxconnectorpatch.so relocation test: "
         "calling solder_dlsym("
-        "Java_com_winlator_xconnector_XConnectorEpoll_createEpollFd)"
+        "Java_com_winlator_xconnector_XConnectorEpollNative_createEpollFd)"
     );
 
     void* resolved = solder_dlsym(
         handle,
-        "Java_com_winlator_xconnector_XConnectorEpoll_createEpollFd"
+        "Java_com_winlator_xconnector_XConnectorEpollNative_createEpollFd"
     );
 
     const char* dlsym_err = solder_dlerror();
