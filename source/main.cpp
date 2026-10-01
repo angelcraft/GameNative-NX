@@ -1384,6 +1384,127 @@ void probe_winlator(std::string& result) {
     }
 }
 
+
+void probe_winlator_11(std::string& result) {
+    result += "\n\n================ LIBWINLATOR_11 ================\n";
+
+    append_log("libwinlator_11.so probe: starting");
+
+    const int flags =
+        SOLDER_LAZY |
+        SOLDER_NO_AUTOLOAD;
+
+    void* handle =
+        solder_dlopen(
+            "libwinlator_11.so",
+            flags
+        );
+
+    const char* err = solder_dlerror();
+
+    if (!handle) {
+        result += "LOAD FAILED\n";
+        result += err ? err : "(no error text)";
+        result += "\n";
+
+        append_logf(
+            "libwinlator_11.so probe failed: %s",
+            err ? err : "(no error text)"
+        );
+        return;
+    }
+
+    result += "ELF LOAD OK\n";
+    result +=
+        "base: " +
+        hex_addr(solder_get_base_addr(handle)) +
+        "\n";
+    result +=
+        "text: " +
+        hex_addr(solder_get_text_addr(handle)) +
+        "\n\n";
+
+    std::string needed;
+    const bool needed_ok = inspect_needed(
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator_11.so",
+        needed
+    );
+
+    if (needed_ok) {
+        result += needed;
+        append_log("libwinlator_11.so dependencies:");
+        append_log(needed.c_str());
+    } else {
+        result += "DEPENDENCY INSPECTION FAILED\n";
+        result += needed;
+        append_logf(
+            "libwinlator_11.so dependency inspection failed: %s",
+            needed.c_str()
+        );
+    }
+
+    std::string symbol_screen;
+    std::string symbol_full;
+
+    const bool symbols_ok = inspect_undefined_symbols(
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator_11.so",
+        symbol_screen,
+        symbol_full
+    );
+
+    result += "\nSTATIC SYMBOL INSPECTION:\n";
+    result += symbol_screen;
+
+    append_log("libwinlator_11.so static undefined symbols:");
+    append_log(symbol_full.c_str());
+
+    append_log(
+        "libwinlator_11.so probe: "
+        "ELF load succeeded (lazy/no-autoload)"
+    );
+
+    result += "\nRELOCATION TEST: createMemoryFd\n";
+    append_log(
+        "libwinlator_11.so relocation test: "
+        "calling solder_dlsym(createMemoryFd)"
+    );
+
+    void* resolved = solder_dlsym(
+        handle,
+        "createMemoryFd"
+    );
+
+    const char* dlsym_err = solder_dlerror();
+
+    if (resolved) {
+        const std::string resolved_text = hex_addr(resolved);
+
+        result += "dlsym: SUCCESS\n";
+        result += "address: " + resolved_text + "\n";
+
+        append_logf(
+            "libwinlator_11.so relocation test: "
+            "SUCCESS, createMemoryFd=%s",
+            resolved_text.c_str()
+        );
+
+        // Keep the relocated module alive for diagnostics.
+        return;
+    }
+
+    result += "dlsym: FAILED\n";
+    result += "error: ";
+    result += dlsym_err ? dlsym_err : "(no error text)";
+    result += "\n";
+
+    append_logf(
+        "libwinlator_11.so relocation test: FAILED: %s",
+        dlsym_err ? dlsym_err : "(no error text)"
+    );
+
+    solder_dlclose(handle);
+}
+
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
@@ -1475,7 +1596,7 @@ int main(int /*argc*/, char** /*argv*/) {
         );
 
         std::printf(
-            "  A      Inspect libwinlator.so\n"
+            "  A      Inspect libwinlator.so + libwinlator_11.so\n"
         );
 
         std::printf(
@@ -1531,6 +1652,7 @@ int main(int /*argc*/, char** /*argv*/) {
             !probed) {
 
             probe_winlator(probe_result);
+            probe_winlator_11(probe_result);
             probed = true;
         }
 
