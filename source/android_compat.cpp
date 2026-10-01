@@ -592,6 +592,27 @@ extern "C" pthread_t gn_android_pthread_self() {
 }
 
 
+
+// ============================================================================
+// Android logging compatibility
+// ============================================================================
+//
+// __android_log_print() is used by libxconnectorpatch.so during its
+// initialization/relocation path. For now we keep it side-effect free on
+// Switch and only consume the arguments so the Android log import is valid.
+//
+// Later this can be redirected to debug.log with Android-style priorities.
+
+extern "C" int gn_android_log_print(
+    int /*priority*/,
+    const char* /*tag*/,
+    const char* /*fmt*/,
+    ...
+) {
+    return 0;
+}
+
+
 // ============================================================================
 // Resolution-only placeholders for remaining Android/system imports
 // ============================================================================
@@ -1031,6 +1052,8 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("pthread_create", (void*)&gn_android_pthread_create),
     SOLDER_EXPORT("pthread_join", (void*)&gn_android_pthread_join),
     SOLDER_EXPORT("pthread_self", (void*)&gn_android_pthread_self),
+
+    SOLDER_EXPORT("__android_log_print", (void*)&gn_android_log_print),
 
     // ------------------------------------------------------------------------
     // Resolution-only Android / C++ runtime / graphics placeholders.
