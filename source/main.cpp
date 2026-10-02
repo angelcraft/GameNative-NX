@@ -1694,6 +1694,11 @@ void probe_xconnector(std::string& result) {
             // Third test: exercise add/remove through the actual JNI wrapper
             // using the event fd when the compatibility layer provides one.
             if (event_fd >= 0) {
+                append_log(
+                    "libxconnectorpatch.so execution test: "
+                    "stage=before addFdToEpoll dlsym"
+                );
+
                 void* add_symbol = solder_dlsym(
                     handle,
                     "Java_com_winlator_xconnector_XConnectorEpollNative_addFdToEpoll"
@@ -1701,9 +1706,22 @@ void probe_xconnector(std::string& result) {
 
                 const char* add_err = solder_dlerror();
 
+                append_log(
+                    add_symbol
+                        ? "libxconnectorpatch.so execution test: "
+                          "stage=after addFdToEpoll dlsym (success)"
+                        : "libxconnectorpatch.so execution test: "
+                          "stage=after addFdToEpoll dlsym (NULL)"
+                );
+
                 if (add_symbol) {
                     auto add_fd =
                         reinterpret_cast<AddFdToEpollFn>(add_symbol);
+
+                    append_log(
+                        "libxconnectorpatch.so execution test: "
+                        "stage=before addFdToEpoll call"
+                    );
 
                     int add_result =
                         add_fd(nullptr, nullptr, epoll_fd, event_fd);
@@ -1722,6 +1740,11 @@ void probe_xconnector(std::string& result) {
                         std::to_string(add_result) +
                         "\n";
 
+                    append_log(
+                        "libxconnectorpatch.so execution test: "
+                        "stage=before removeFdFromEpoll dlsym"
+                    );
+
                     void* remove_symbol = solder_dlsym(
                         handle,
                         "Java_com_winlator_xconnector_XConnectorEpollNative_removeFdFromEpoll"
@@ -1729,7 +1752,19 @@ void probe_xconnector(std::string& result) {
 
                     const char* remove_err = solder_dlerror();
 
+                    append_log(
+                        remove_symbol
+                            ? "libxconnectorpatch.so execution test: "
+                              "stage=after removeFdFromEpoll dlsym (success)"
+                            : "libxconnectorpatch.so execution test: "
+                              "stage=after removeFdFromEpoll dlsym (NULL)"
+                    );
+
                     if (remove_symbol) {
+                        append_log(
+                            "libxconnectorpatch.so execution test: "
+                            "stage=before removeFdFromEpoll call"
+                        );
                         auto remove_fd =
                             reinterpret_cast<RemoveFdFromEpollFn>(remove_symbol);
 
