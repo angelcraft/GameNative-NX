@@ -1,10 +1,19 @@
 #include "android_compat.hpp"
+#include <switch.h>
 
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
 #include <unistd.h>
-#include <pthread.h>
+
+#include <dirent.h>
 #include <fcntl.h>
+#include <locale.h>
+#include <pthread.h>
+#include <time.h>
+#include <wctype.h>
 
 #include <cerrno>
 #include <cstdint>
@@ -847,6 +856,457 @@ extern "C" int gn_android_log_print(
 
 
 // ============================================================================
+// Batch libc / POSIX compatibility
+// ============================================================================
+
+extern "C" char* gn_android_getenv(const char* name) {
+    if (!name) { errno = EINVAL; return nullptr; }
+    return std::getenv(name);
+}
+
+extern "C" int gn_android_setenv(const char* name, const char* value, int overwrite) {
+    if (!name || !value) { errno = EINVAL; return -1; }
+    return ::setenv(name, value, overwrite);
+}
+
+extern "C" int gn_android_unsetenv(const char* name) {
+    if (!name) { errno = EINVAL; return -1; }
+    return ::unsetenv(name);
+}
+
+extern "C" int gn_android_system_property_get(const char* name, char* value) {
+    if (!name || !value) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    value[0] = '\0';
+
+    // These properties describe the architecture we are actually exposing
+    // from this Switch port.  Unknown Android properties are treated as absent
+    // instead of inventing device/build information.
+    if (std::strcmp(name, "ro.product.cpu.abi") == 0 ||
+        std::strcmp(name, "ro.product.cpu.abilist64") == 0 ||
+        std::strcmp(name, "ro.product.cpu.abilist") == 0) {
+        std::strcpy(value, "arm64-v8a");
+        return 9;
+    }
+
+    return 0;
+}
+
+extern "C" unsigned long gn_android_getauxval(unsigned long type) {
+    constexpr unsigned long AT_PAGESZ = 6;
+    constexpr unsigned long AT_HWCAP = 16;
+    constexpr unsigned long AT_HWCAP2 = 26;
+    constexpr unsigned long AT_SECURE = 23;
+    switch (type) {
+        case AT_PAGESZ: return 0x1000UL;
+        case AT_HWCAP:
+        case AT_HWCAP2:
+        case AT_SECURE:
+        default: return 0;
+    }
+}
+
+extern "C" int gn_android_getpagesize() { return 0x1000; }
+
+extern "C" int gn_android_mprotect(void* addr, size_t length, int prot) {
+    if (!addr || length == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    constexpr int PROT_READ_GN = 0x1;
+    constexpr int PROT_WRITE_GN = 0x2;
+    constexpr int PROT_EXEC_GN = 0x4;
+
+    if (prot & PROT_EXEC_GN) {
+        // Horizon's process memory permission syscall does not allow X here.
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    constexpr uintptr_t kPageMask = 0xFFF;
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t page_start = start & ~kPageMask;
+    uintptr_t page_end = (start + length + kPageMask) & ~kPageMask;
+    if (page_end < page_start) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    u32 permission = Perm_None;
+    if (prot & PROT_READ_GN)
+        permission |= Perm_R;
+    if (prot & PROT_WRITE_GN)
+        permission |= Perm_W;
+
+    Result rc = svcSetMemoryPermission(
+        reinterpret_cast<void*>(page_start),
+        static_cast<u64>(page_end - page_start),
+        permission
+    );
+
+    if (R_FAILED(rc)) {
+        errno = EACCES;
+        return -1;
+    }
+
+    return 0;
+}
+
+extern "C" long gn_android_sysconf(int name) {
+#ifdef _SC_PAGESIZE
+    if (name == _SC_PAGESIZE) return 0x1000;
+#endif
+#ifdef _SC_PAGE_SIZE
+    if (name == _SC_PAGE_SIZE) return 0x1000;
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+    if (name == _SC_NPROCESSORS_ONLN) return 4;
+#endif
+#ifdef _SC_NPROCESSORS_CONF
+    if (name == _SC_NPROCESSORS_CONF) return 4;
+#endif
+#ifdef _SC_CLK_TCK
+    if (name == _SC_CLK_TCK) return 100;
+#endif
+    errno = EINVAL;
+    return -1;
+}
+
+extern "C" int gn_android_getpid() { return 1; }
+extern "C" unsigned int gn_android_getuid() { return 0; }
+extern "C" unsigned int gn_android_getgid() { return 0; }
+
+extern "C" int gn_android_open_2(const char* path, int flags) {
+    return ::open(path, flags, 0666);
+}
+
+extern "C" int gn_android_openat(int dirfd, const char* path, int flags, ...) {
+    mode_t mode = 0666;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = static_cast<mode_t>(va_arg(ap, int));
+        va_end(ap);
+    }
+    return ::openat(dirfd, path, flags, mode);
+}
+
+extern "C" int gn_android_fcntl(int fd, int cmd, ...) {
+    va_list ap;
+    va_start(ap, cmd);
+    long arg = 0;
+    // Commands that do not consume a third argument are common in Android
+    // code.  Passing no third argument would require command-by-command
+    // knowledge, so we conservatively provide a zero-sized slot; on AArch64
+    // the ABI uses the same general-purpose register width for the vararg.
+    arg = va_arg(ap, long);
+    va_end(ap);
+    return ::fcntl(fd, cmd, arg);
+}
+
+extern "C" int gn_android_access(const char* path, int mode) {
+    return ::access(path, mode);
+}
+extern "C" int gn_android_mkdir(const char* path, mode_t mode) {
+    return ::mkdir(path, mode);
+}
+extern "C" int gn_android_rename(const char* old_path, const char* new_path) {
+    return ::rename(old_path, new_path);
+}
+extern "C" int gn_android_remove(const char* path) {
+    return ::remove(path);
+}
+extern "C" int gn_android_fchmod(int fd, mode_t mode) {
+    return ::fchmod(fd, mode);
+}
+extern "C" int gn_android_fchmodat(int dirfd, const char* path, mode_t mode, int flags) {
+    return ::fchmodat(dirfd, path, mode, flags);
+}
+extern "C" int gn_android_unlinkat(int dirfd, const char* path, int flags) {
+    return ::unlinkat(dirfd, path, flags);
+}
+extern "C" int gn_android_truncate(const char* path, off_t length) {
+    return ::truncate(path, length);
+}
+extern "C" int gn_android_utimensat(int dirfd, const char* path, const struct timespec times[2], int flags) {
+    return ::utimensat(dirfd, path, times, flags);
+}
+extern "C" long gn_android_pathconf(const char* path, int name) {
+    return ::pathconf(path, name);
+}
+extern "C" ssize_t gn_android_readlink(const char* path, char* buf, size_t size) {
+    return ::readlink(path, buf, size);
+}
+extern "C" int gn_android_symlink(const char* target, const char* linkpath) {
+    return ::symlink(target, linkpath);
+}
+extern "C" int gn_android_link(const char* oldpath, const char* newpath) {
+    return ::link(oldpath, newpath);
+}
+extern "C" char* gn_android_realpath(const char* path, char* resolved) {
+    return ::realpath(path, resolved);
+}
+extern "C" DIR* gn_android_opendir(const char* path) { return ::opendir(path); }
+extern "C" struct dirent* gn_android_readdir(DIR* dir) { return ::readdir(dir); }
+extern "C" int gn_android_closedir(DIR* dir) { return ::closedir(dir); }
+extern "C" DIR* gn_android_fdopendir(int fd) { return ::fdopendir(fd); }
+
+extern "C" int gn_android_fseeko(FILE* stream, off_t offset, int whence) {
+    return ::fseeko(stream, offset, whence);
+}
+extern "C" off_t gn_android_ftello(FILE* stream) { return ::ftello(stream); }
+extern "C" int gn_android_ferror(FILE* stream) { return std::ferror(stream); }
+extern "C" int gn_android_feof(FILE* stream) { return std::feof(stream); }
+extern "C" int gn_android_putchar(int c) { return std::putchar(c); }
+
+extern "C" int gn_android_strerror_r(int errnum, char* buf, size_t buflen) {
+    if (!buf || !buflen) { errno = EINVAL; return EINVAL; }
+    const char* s = ::strerror(errnum);
+    if (!s) s = "Unknown error";
+    int n = std::snprintf(buf, buflen, "%s", s);
+    if (n < 0) return EINVAL;
+    if (static_cast<size_t>(n) >= buflen) return ERANGE;
+    return 0;
+}
+
+extern "C" int gn_android_dprintf(int fd, const char* fmt, ...) {
+    if (!fmt) { errno = EINVAL; return -1; }
+    va_list ap;
+    va_start(ap, fmt);
+    va_list copy;
+    va_copy(copy, ap);
+    int needed = std::vsnprintf(nullptr, 0, fmt, copy);
+    va_end(copy);
+    if (needed < 0) { va_end(ap); return -1; }
+    size_t size = static_cast<size_t>(needed) + 1;
+    char* buf = static_cast<char*>(std::malloc(size));
+    if (!buf) { va_end(ap); errno = ENOMEM; return -1; }
+    std::vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    ssize_t n = ::write(fd, buf, static_cast<size_t>(needed));
+    std::free(buf);
+    return n < 0 ? -1 : static_cast<int>(n);
+}
+
+extern "C" int gn_android_vsnprintf_chk(char* dst, size_t dst_size, int, size_t obj_size,
+                                          const char* fmt, va_list ap) {
+    if (!dst || !fmt) { errno = EINVAL; return -1; }
+    if (obj_size != static_cast<size_t>(-1) && obj_size < dst_size) dst_size = obj_size;
+    if (!dst_size) { errno = ERANGE; return -1; }
+    return std::vsnprintf(dst, dst_size, fmt, ap);
+}
+
+extern "C" void* gn_android_memcpy_chk(void* dst, const void* src, size_t n, size_t dst_size) {
+    if (!dst || !src || n > dst_size) { errno = ERANGE; return nullptr; }
+    return std::memcpy(dst, src, n);
+}
+extern "C" void* gn_android_memset_chk(void* dst, int c, size_t n, size_t dst_size) {
+    if (!dst || n > dst_size) { errno = ERANGE; return nullptr; }
+    return std::memset(dst, c, n);
+}
+extern "C" void* gn_android_memmove_chk(void* dst, const void* src, size_t n, size_t dst_size) {
+    if (!dst || !src || n > dst_size) { errno = ERANGE; return nullptr; }
+    return std::memmove(dst, src, n);
+}
+extern "C" char* gn_android_strcat_chk(char* dst, const char* src, size_t dst_size) {
+    if (!dst || !src) { errno = EINVAL; return nullptr; }
+    size_t dl = std::strlen(dst), sl = std::strlen(src);
+    if (dl >= dst_size || sl > dst_size - dl - 1) { errno = ERANGE; return nullptr; }
+    return std::strcat(dst, src);
+}
+extern "C" char* gn_android_strchr_chk(const char* str, int ch, size_t maxlen) {
+    if (!str) { errno = EINVAL; return nullptr; }
+    for (size_t i = 0; i < maxlen; ++i) {
+        if (str[i] == static_cast<char>(ch)) return const_cast<char*>(str + i);
+        if (str[i] == '\0') break;
+    }
+    return nullptr;
+}
+extern "C" char* gn_android_strncpy_chk2(
+    char* dst, const char* src, size_t count, size_t dst_size, size_t src_size
+) {
+    if (!dst || !src || count > dst_size) { errno = ERANGE; return nullptr; }
+    if (src_size != static_cast<size_t>(-1)) {
+        size_t copy_limit = count < src_size ? count : src_size;
+        size_t i = 0;
+        for (; i < copy_limit; ++i) {
+            dst[i] = src[i];
+            if (src[i] == '\0') break;
+        }
+        if (i == src_size && count > src_size) { errno = ERANGE; return nullptr; }
+        for (++i; i < count; ++i) dst[i] = '\0';
+        return dst;
+    }
+    return std::strncpy(dst, src, count);
+}
+
+extern "C" const char* gn_android_strstr(const char* a, const char* b) { return std::strstr(a, b); }
+extern "C" char* gn_android_strchr2(const char* a, int b) { return const_cast<char*>(std::strchr(a, b)); }
+extern "C" char* gn_android_strrchr2(const char* a, int b) { return const_cast<char*>(std::strrchr(a, b)); }
+extern "C" size_t gn_android_strcspn(const char* a, const char* b) { return std::strcspn(a, b); }
+
+extern "C" int gn_android_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    if (!memptr || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) return EINVAL;
+    return ::posix_memalign(memptr, alignment, size);
+}
+extern "C" int gn_android_gettimeofday(struct timeval* tv, void* tz) {
+    return ::gettimeofday(tv, static_cast<struct timezone*>(tz));
+}
+extern "C" int gn_android_nanosleep(const struct timespec* req, struct timespec* rem) {
+    return ::nanosleep(req, rem);
+}
+
+extern "C" long long gn_android_strtoll64(const char* s, char** e, int b) {
+    return static_cast<long long>(std::strtol(s, e, b));
+}
+extern "C" unsigned long long gn_android_strtoull(const char* s, char** e, int b) {
+    return static_cast<unsigned long long>(std::strtoul(s, e, b));
+}
+extern "C" long double gn_android_strtold(const char* s, char** e) {
+    return static_cast<long double>(std::strtod(s, e));
+}
+extern "C" intmax_t gn_android_strtoimax(const char* s, char** e, int b) {
+    return static_cast<intmax_t>(std::strtol(s, e, b));
+}
+extern "C" uintmax_t gn_android_strtoumax(const char* s, char** e, int b) {
+    return static_cast<uintmax_t>(std::strtoul(s, e, b));
+}
+extern "C" long gn_android_wcstol(const wchar_t* s, wchar_t** e, int b) { return ::wcstol(s, e, b); }
+extern "C" unsigned long gn_android_wcstoul(const wchar_t* s, wchar_t** e, int b) { return ::wcstoul(s, e, b); }
+extern "C" long long gn_android_wcstoll(const wchar_t* s, wchar_t** e, int b) { return static_cast<long long>(::wcstol(s, e, b)); }
+extern "C" unsigned long long gn_android_wcstoull(const wchar_t* s, wchar_t** e, int b) { return static_cast<unsigned long long>(::wcstoul(s, e, b)); }
+extern "C" long double gn_android_wcstold(const wchar_t* s, wchar_t** e) { return static_cast<long double>(::wcstod(s, e)); }
+extern "C" long long gn_android_strtoll_l(const char* s, char** e, int b, locale_t) {
+    return gn_android_strtoll64(s, e, b);
+}
+extern "C" unsigned long long gn_android_strtoull_l(const char* s, char** e, int b, locale_t) {
+    return gn_android_strtoull(s, e, b);
+}
+extern "C" long double gn_android_strtold_l(const char* s, char** e, locale_t) {
+    return gn_android_strtold(s, e);
+}
+extern "C" long long gn_android_wcstoll_l(const wchar_t* s, wchar_t** e, int b, locale_t) {
+    return gn_android_wcstoll(s, e, b);
+}
+extern "C" unsigned long long gn_android_wcstoull_l(const wchar_t* s, wchar_t** e, int b, locale_t) {
+    return gn_android_wcstoull(s, e, b);
+}
+extern "C" long double gn_android_wcstold_l(const wchar_t* s, wchar_t** e, locale_t) {
+    return gn_android_wcstold(s, e);
+}
+
+extern "C" int gn_android_swprintf(wchar_t* dst, size_t count, const wchar_t* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = ::vswprintf(dst, count, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+extern "C" int gn_android_vasprintf(char** out, const char* fmt, va_list ap) {
+    if (!out || !fmt) { errno = EINVAL; return -1; }
+    va_list copy;
+    va_copy(copy, ap);
+    int needed = std::vsnprintf(nullptr, 0, fmt, copy);
+    va_end(copy);
+    if (needed < 0) return -1;
+    char* buf = static_cast<char*>(std::malloc(static_cast<size_t>(needed) + 1));
+    if (!buf) { errno = ENOMEM; return -1; }
+    std::vsnprintf(buf, static_cast<size_t>(needed) + 1, fmt, ap);
+    *out = buf;
+    return needed;
+}
+
+extern "C" int gn_android_asprintf(char** out, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = gn_android_vasprintf(out, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+extern "C" void* gn_android_android_dlopen_ext(const char* filename, int flags, const void*) {
+    return gn_android_dlopen(filename, flags);
+}
+extern "C" void gn_android_set_abort_message(const char*) {}
+extern "C" void gn_android_openlog(const char*, int, int) {}
+extern "C" void gn_android_closelog() {}
+extern "C" void gn_android_syslog(int, const char*, ...) {}
+extern "C" void gn_android_assert2(const char*, int, const char*, const char*) { std::abort(); }
+extern "C" int gn_android_cxa_thread_atexit_impl(void (*)(void*), void*, void*) { return 0; }
+
+static int g_dummy_locale_storage = 0;
+static thread_local locale_t g_current_locale = nullptr;
+extern "C" locale_t gn_android_newlocale(int, const char*, locale_t) {
+    return reinterpret_cast<locale_t>(&g_dummy_locale_storage);
+}
+extern "C" locale_t gn_android_uselocale(locale_t loc) {
+    locale_t prev = g_current_locale;
+    if (loc) g_current_locale = loc;
+    return prev;
+}
+extern "C" void gn_android_freelocale(locale_t) {}
+extern "C" int gn_android_strcoll_l(const char* a, const char* b, locale_t) { return std::strcmp(a, b); }
+extern "C" size_t gn_android_strxfrm_l(char* d, const char* s, size_t n, locale_t) {
+    size_t len = std::strlen(s);
+    if (n) { size_t c = len < n - 1 ? len : n - 1; std::memcpy(d, s, c); d[c] = '\0'; }
+    return len;
+}
+extern "C" int gn_android_wcscoll_l(const wchar_t* a, const wchar_t* b, locale_t) { return std::wcscmp(a, b); }
+extern "C" size_t gn_android_wcsxfrm_l(wchar_t* d, const wchar_t* s, size_t n, locale_t) {
+    size_t len = std::wcslen(s);
+    if (n) { size_t c = len < n - 1 ? len : n - 1; std::wmemcpy(d, s, c); d[c] = L'\0'; }
+    return len;
+}
+extern "C" size_t gn_android_strftime_l(char* d, size_t n, const char* f, const struct tm* t, locale_t) { return ::strftime(d, n, f, t); }
+extern "C" int gn_android_iswalpha_l(wint_t c, locale_t) { return ::iswalpha(c); }
+extern "C" int gn_android_iswblank_l(wint_t c, locale_t) { return ::iswblank(c); }
+extern "C" int gn_android_iswcntrl_l(wint_t c, locale_t) { return ::iswcntrl(c); }
+extern "C" int gn_android_iswdigit_l(wint_t c, locale_t) { return ::iswdigit(c); }
+extern "C" int gn_android_iswlower_l(wint_t c, locale_t) { return ::iswlower(c); }
+extern "C" int gn_android_iswprint_l(wint_t c, locale_t) { return ::iswprint(c); }
+extern "C" int gn_android_iswpunct_l(wint_t c, locale_t) { return ::iswpunct(c); }
+extern "C" int gn_android_iswspace_l(wint_t c, locale_t) { return ::iswspace(c); }
+extern "C" int gn_android_iswupper_l(wint_t c, locale_t) { return ::iswupper(c); }
+extern "C" int gn_android_iswxdigit_l(wint_t c, locale_t) { return ::iswxdigit(c); }
+extern "C" wint_t gn_android_towupper_l(wint_t c, locale_t) { return ::towupper(c); }
+extern "C" wint_t gn_android_towlower_l(wint_t c, locale_t) { return ::towlower(c); }
+extern "C" size_t gn_android_mbrlen(const char* s, size_t n, mbstate_t* ps) { return ::mbrlen(s, n, ps); }
+extern "C" size_t gn_android_mbsrtowcs(wchar_t* d, const char** s, size_t n, mbstate_t* ps) { return ::mbsrtowcs(d, s, n, ps); }
+extern "C" size_t gn_android_mbsnrtowcs(wchar_t* d, const char** s, size_t m, size_t n, mbstate_t* ps) { return ::mbsnrtowcs(d, s, m, n, ps); }
+extern "C" size_t gn_android_wcsnrtombs(char* d, const wchar_t** s, size_t m, size_t n, mbstate_t* ps) { return ::wcsnrtombs(d, s, m, n, ps); }
+extern "C" size_t gn_android_mbtowc(wchar_t* d, const char* s, size_t n) { return ::mbtowc(d, s, n); }
+extern "C" size_t gn_android_ctype_get_mb_cur_max() { return 1; }
+extern "C" struct lconv* gn_android_localeconv() { return ::localeconv(); }
+
+extern "C" int gn_android_pthread_mutex_init(pthread_mutex_t* m, const pthread_mutexattr_t* a) { return ::pthread_mutex_init(m, a); }
+extern "C" int gn_android_pthread_mutex_destroy(pthread_mutex_t* m) { return ::pthread_mutex_destroy(m); }
+extern "C" int gn_android_pthread_mutex_trylock(pthread_mutex_t* m) { return ::pthread_mutex_trylock(m); }
+extern "C" int gn_android_pthread_mutexattr_init(pthread_mutexattr_t* a) { return ::pthread_mutexattr_init(a); }
+extern "C" int gn_android_pthread_mutexattr_settype(pthread_mutexattr_t* a, int t) { return ::pthread_mutexattr_settype(a, t); }
+extern "C" int gn_android_pthread_mutexattr_destroy(pthread_mutexattr_t* a) { return ::pthread_mutexattr_destroy(a); }
+extern "C" int gn_android_pthread_cond_init(pthread_cond_t* c, const pthread_condattr_t* a) { return ::pthread_cond_init(c, a); }
+extern "C" int gn_android_pthread_cond_destroy(pthread_cond_t* c) { return ::pthread_cond_destroy(c); }
+extern "C" int gn_android_pthread_cond_signal(pthread_cond_t* c) { return ::pthread_cond_signal(c); }
+extern "C" int gn_android_pthread_cond_timedwait(pthread_cond_t* c, pthread_mutex_t* m, const struct timespec* t) { return ::pthread_cond_timedwait(c, m, t); }
+extern "C" int gn_android_pthread_condattr_init(pthread_condattr_t* a) { return ::pthread_condattr_init(a); }
+extern "C" int gn_android_pthread_condattr_setclock(pthread_condattr_t* a, clockid_t id) { return ::pthread_condattr_setclock(a, id); }
+extern "C" int gn_android_pthread_condattr_destroy(pthread_condattr_t* a) { return ::pthread_condattr_destroy(a); }
+extern "C" int gn_android_pthread_detach(pthread_t t) { return ::pthread_detach(t); }
+extern "C" int gn_android_pthread_rwlock_init(pthread_rwlock_t* l, const pthread_rwlockattr_t* a) { return ::pthread_rwlock_init(l, a); }
+extern "C" int gn_android_pthread_rwlock_destroy(pthread_rwlock_t* l) { return ::pthread_rwlock_destroy(l); }
+extern "C" int gn_android_pthread_rwlock_rdlock(pthread_rwlock_t* l) { return ::pthread_rwlock_rdlock(l); }
+extern "C" int gn_android_pthread_rwlock_wrlock(pthread_rwlock_t* l) { return ::pthread_rwlock_wrlock(l); }
+extern "C" int gn_android_pthread_rwlock_unlock(pthread_rwlock_t* l) { return ::pthread_rwlock_unlock(l); }
+extern "C" int gn_android_vfprintf(FILE* f, const char* fmt, va_list ap) { return ::vfprintf(f, fmt, ap); }
+extern "C" int gn_android_vsscanf(const char* s, const char* fmt, va_list ap) { return ::vsscanf(s, fmt, ap); }
+
+
+// ============================================================================
 // Resolution-only placeholders for remaining Android/system imports
 // ============================================================================
 //
@@ -1340,6 +1800,135 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("pthread_self", (void*)&gn_android_pthread_self),
 
     SOLDER_EXPORT("__android_log_print", (void*)&gn_android_log_print),
+    SOLDER_EXPORT("__system_property_get", (void*)&gn_android_system_property_get),
+    SOLDER_EXPORT("__open_2", (void*)&gn_android_open_2),
+    SOLDER_EXPORT("openat", (void*)&gn_android_openat),
+    SOLDER_EXPORT("fcntl", (void*)&gn_android_fcntl),
+    SOLDER_EXPORT("mprotect", (void*)&gn_android_mprotect),
+    SOLDER_EXPORT("strtoimax", (void*)&gn_android_strtoimax),
+    SOLDER_EXPORT("strtoumax", (void*)&gn_android_strtoumax),
+    SOLDER_EXPORT("strtoll_l", (void*)&gn_android_strtoll_l),
+    SOLDER_EXPORT("strtoull_l", (void*)&gn_android_strtoull_l),
+    SOLDER_EXPORT("strtold_l", (void*)&gn_android_strtold_l),
+    SOLDER_EXPORT("wcstoll_l", (void*)&gn_android_wcstoll_l),
+    SOLDER_EXPORT("wcstoull_l", (void*)&gn_android_wcstoull_l),
+    SOLDER_EXPORT("wcstold_l", (void*)&gn_android_wcstold_l),
+
+    // Batch libc / POSIX compatibility.
+    SOLDER_EXPORT("getenv", (void*)&gn_android_getenv),
+    SOLDER_EXPORT("setenv", (void*)&gn_android_setenv),
+    SOLDER_EXPORT("unsetenv", (void*)&gn_android_unsetenv),
+    SOLDER_EXPORT("getauxval", (void*)&gn_android_getauxval),
+    SOLDER_EXPORT("getpagesize", (void*)&gn_android_getpagesize),
+    SOLDER_EXPORT("sysconf", (void*)&gn_android_sysconf),
+    SOLDER_EXPORT("getpid", (void*)&gn_android_getpid),
+    SOLDER_EXPORT("getuid", (void*)&gn_android_getuid),
+    SOLDER_EXPORT("getgid", (void*)&gn_android_getgid),
+    SOLDER_EXPORT("access", (void*)&gn_android_access),
+    SOLDER_EXPORT("mkdir", (void*)&gn_android_mkdir),
+    SOLDER_EXPORT("rename", (void*)&gn_android_rename),
+    SOLDER_EXPORT("remove", (void*)&gn_android_remove),
+    SOLDER_EXPORT("fchmod", (void*)&gn_android_fchmod),
+    SOLDER_EXPORT("fchmodat", (void*)&gn_android_fchmodat),
+    SOLDER_EXPORT("unlinkat", (void*)&gn_android_unlinkat),
+    SOLDER_EXPORT("truncate", (void*)&gn_android_truncate),
+    SOLDER_EXPORT("utimensat", (void*)&gn_android_utimensat),
+    SOLDER_EXPORT("pathconf", (void*)&gn_android_pathconf),
+    SOLDER_EXPORT("readlink", (void*)&gn_android_readlink),
+    SOLDER_EXPORT("symlink", (void*)&gn_android_symlink),
+    SOLDER_EXPORT("link", (void*)&gn_android_link),
+    SOLDER_EXPORT("realpath", (void*)&gn_android_realpath),
+    SOLDER_EXPORT("opendir", (void*)&gn_android_opendir),
+    SOLDER_EXPORT("readdir", (void*)&gn_android_readdir),
+    SOLDER_EXPORT("closedir", (void*)&gn_android_closedir),
+    SOLDER_EXPORT("fdopendir", (void*)&gn_android_fdopendir),
+    SOLDER_EXPORT("fseeko", (void*)&gn_android_fseeko),
+    SOLDER_EXPORT("ftello", (void*)&gn_android_ftello),
+    SOLDER_EXPORT("ferror", (void*)&gn_android_ferror),
+    SOLDER_EXPORT("feof", (void*)&gn_android_feof),
+    SOLDER_EXPORT("putchar", (void*)&gn_android_putchar),
+    SOLDER_EXPORT("strerror_r", (void*)&gn_android_strerror_r),
+    SOLDER_EXPORT("dprintf", (void*)&gn_android_dprintf),
+    SOLDER_EXPORT("__vsnprintf_chk", (void*)&gn_android_vsnprintf_chk),
+    SOLDER_EXPORT("__memcpy_chk", (void*)&gn_android_memcpy_chk),
+    SOLDER_EXPORT("__memset_chk", (void*)&gn_android_memset_chk),
+    SOLDER_EXPORT("__memmove_chk", (void*)&gn_android_memmove_chk),
+    SOLDER_EXPORT("__strcat_chk", (void*)&gn_android_strcat_chk),
+    SOLDER_EXPORT("__strchr_chk", (void*)&gn_android_strchr_chk),
+    SOLDER_EXPORT("__strncpy_chk2", (void*)&gn_android_strncpy_chk2),
+    SOLDER_EXPORT("strstr", (void*)&gn_android_strstr),
+    SOLDER_EXPORT("strchr", (void*)&gn_android_strchr2),
+    SOLDER_EXPORT("strrchr", (void*)&gn_android_strrchr2),
+    SOLDER_EXPORT("strcspn", (void*)&gn_android_strcspn),
+    SOLDER_EXPORT("posix_memalign", (void*)&gn_android_posix_memalign),
+    SOLDER_EXPORT("gettimeofday", (void*)&gn_android_gettimeofday),
+    SOLDER_EXPORT("nanosleep", (void*)&gn_android_nanosleep),
+    SOLDER_EXPORT("strtoll", (void*)&gn_android_strtoll64),
+    SOLDER_EXPORT("strtoull", (void*)&gn_android_strtoull),
+    SOLDER_EXPORT("strtold", (void*)&gn_android_strtold),
+    SOLDER_EXPORT("wcstol", (void*)&gn_android_wcstol),
+    SOLDER_EXPORT("wcstoul", (void*)&gn_android_wcstoul),
+    SOLDER_EXPORT("wcstoll", (void*)&gn_android_wcstoll),
+    SOLDER_EXPORT("wcstoull", (void*)&gn_android_wcstoull),
+    SOLDER_EXPORT("wcstold", (void*)&gn_android_wcstold),
+    SOLDER_EXPORT("swprintf", (void*)&gn_android_swprintf),
+    SOLDER_EXPORT("vasprintf", (void*)&gn_android_vasprintf),
+    SOLDER_EXPORT("asprintf", (void*)&gn_android_asprintf),
+    SOLDER_EXPORT("vfprintf", (void*)&gn_android_vfprintf),
+    SOLDER_EXPORT("vsscanf", (void*)&gn_android_vsscanf),
+    SOLDER_EXPORT("android_dlopen_ext", (void*)&gn_android_android_dlopen_ext),
+    SOLDER_EXPORT("android_set_abort_message", (void*)&gn_android_set_abort_message),
+    SOLDER_EXPORT("openlog", (void*)&gn_android_openlog),
+    SOLDER_EXPORT("syslog", (void*)&gn_android_syslog),
+    SOLDER_EXPORT("closelog", (void*)&gn_android_closelog),
+    SOLDER_EXPORT("__assert2", (void*)&gn_android_assert2),
+    SOLDER_EXPORT("__cxa_thread_atexit_impl", (void*)&gn_android_cxa_thread_atexit_impl),
+    SOLDER_EXPORT("newlocale", (void*)&gn_android_newlocale),
+    SOLDER_EXPORT("uselocale", (void*)&gn_android_uselocale),
+    SOLDER_EXPORT("freelocale", (void*)&gn_android_freelocale),
+    SOLDER_EXPORT("strcoll_l", (void*)&gn_android_strcoll_l),
+    SOLDER_EXPORT("strxfrm_l", (void*)&gn_android_strxfrm_l),
+    SOLDER_EXPORT("wcscoll_l", (void*)&gn_android_wcscoll_l),
+    SOLDER_EXPORT("wcsxfrm_l", (void*)&gn_android_wcsxfrm_l),
+    SOLDER_EXPORT("strftime_l", (void*)&gn_android_strftime_l),
+    SOLDER_EXPORT("iswalpha_l", (void*)&gn_android_iswalpha_l),
+    SOLDER_EXPORT("iswblank_l", (void*)&gn_android_iswblank_l),
+    SOLDER_EXPORT("iswcntrl_l", (void*)&gn_android_iswcntrl_l),
+    SOLDER_EXPORT("iswdigit_l", (void*)&gn_android_iswdigit_l),
+    SOLDER_EXPORT("iswlower_l", (void*)&gn_android_iswlower_l),
+    SOLDER_EXPORT("iswprint_l", (void*)&gn_android_iswprint_l),
+    SOLDER_EXPORT("iswpunct_l", (void*)&gn_android_iswpunct_l),
+    SOLDER_EXPORT("iswspace_l", (void*)&gn_android_iswspace_l),
+    SOLDER_EXPORT("iswupper_l", (void*)&gn_android_iswupper_l),
+    SOLDER_EXPORT("iswxdigit_l", (void*)&gn_android_iswxdigit_l),
+    SOLDER_EXPORT("towupper_l", (void*)&gn_android_towupper_l),
+    SOLDER_EXPORT("towlower_l", (void*)&gn_android_towlower_l),
+    SOLDER_EXPORT("mbrlen", (void*)&gn_android_mbrlen),
+    SOLDER_EXPORT("mbsrtowcs", (void*)&gn_android_mbsrtowcs),
+    SOLDER_EXPORT("mbsnrtowcs", (void*)&gn_android_mbsnrtowcs),
+    SOLDER_EXPORT("wcsnrtombs", (void*)&gn_android_wcsnrtombs),
+    SOLDER_EXPORT("mbtowc", (void*)&gn_android_mbtowc),
+    SOLDER_EXPORT("__ctype_get_mb_cur_max", (void*)&gn_android_ctype_get_mb_cur_max),
+    SOLDER_EXPORT("localeconv", (void*)&gn_android_localeconv),
+    SOLDER_EXPORT("pthread_mutex_init", (void*)&gn_android_pthread_mutex_init),
+    SOLDER_EXPORT("pthread_mutex_destroy", (void*)&gn_android_pthread_mutex_destroy),
+    SOLDER_EXPORT("pthread_mutex_trylock", (void*)&gn_android_pthread_mutex_trylock),
+    SOLDER_EXPORT("pthread_mutexattr_init", (void*)&gn_android_pthread_mutexattr_init),
+    SOLDER_EXPORT("pthread_mutexattr_settype", (void*)&gn_android_pthread_mutexattr_settype),
+    SOLDER_EXPORT("pthread_mutexattr_destroy", (void*)&gn_android_pthread_mutexattr_destroy),
+    SOLDER_EXPORT("pthread_cond_init", (void*)&gn_android_pthread_cond_init),
+    SOLDER_EXPORT("pthread_cond_destroy", (void*)&gn_android_pthread_cond_destroy),
+    SOLDER_EXPORT("pthread_cond_signal", (void*)&gn_android_pthread_cond_signal),
+    SOLDER_EXPORT("pthread_cond_timedwait", (void*)&gn_android_pthread_cond_timedwait),
+    SOLDER_EXPORT("pthread_condattr_init", (void*)&gn_android_pthread_condattr_init),
+    SOLDER_EXPORT("pthread_condattr_setclock", (void*)&gn_android_pthread_condattr_setclock),
+    SOLDER_EXPORT("pthread_condattr_destroy", (void*)&gn_android_pthread_condattr_destroy),
+    SOLDER_EXPORT("pthread_detach", (void*)&gn_android_pthread_detach),
+    SOLDER_EXPORT("pthread_rwlock_init", (void*)&gn_android_pthread_rwlock_init),
+    SOLDER_EXPORT("pthread_rwlock_destroy", (void*)&gn_android_pthread_rwlock_destroy),
+    SOLDER_EXPORT("pthread_rwlock_rdlock", (void*)&gn_android_pthread_rwlock_rdlock),
+    SOLDER_EXPORT("pthread_rwlock_wrlock", (void*)&gn_android_pthread_rwlock_wrlock),
+    SOLDER_EXPORT("pthread_rwlock_unlock", (void*)&gn_android_pthread_rwlock_unlock),
 
     // ------------------------------------------------------------------------
     // Resolution-only Android / C++ runtime / graphics placeholders.
