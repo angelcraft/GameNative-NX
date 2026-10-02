@@ -1888,9 +1888,274 @@ void probe_xconnector(std::string& result) {
     solder_dlclose(handle);
 }
 
+
+
+void batch_audit_all_sos(std::string& result) {
+    result.clear();
+
+    append_log("============================================================");
+    append_log("BATCH AUDIT: ARM64 .so inventory + lazy load");
+    append_log("No relocation/execution is attempted in this pass.");
+    append_log("============================================================");
+
+    DIR* dir = opendir(kNativeDir);
+    if (!dir) {
+        result = "FAILED: cannot open native directory\n";
+        append_log("BATCH AUDIT: opendir FAILED");
+        return;
+    }
+
+    std::string names[64];
+    size_t count = 0;
+
+    while (dirent* e = readdir(dir)) {
+        if (e->d_type != DT_REG)
+            continue;
+
+        const char* dot = std::strrchr(e->d_name, '.');
+        if (!dot || std::strcmp(dot, ".so") != 0)
+            continue;
+
+        if (count >= 64)
+            break;
+
+        names[count++] = e->d_name;
+    }
+
+    closedir(dir);
+
+    // Stable alphabetical order without depending on std::sort.
+    for (size_t i = 0; i < count; ++i) {
+        for (size_t j = i + 1; j < count; ++j) {
+            if (names[j] < names[i]) {
+                std::string tmp = names[i];
+                names[i] = names[j];
+                names[j] = tmp;
+            }
+        }
+    }
+
+    result += "Found " + std::to_string(count) + " ARM64 .so files\n\n";
+
+    int load_ok_count = 0;
+    int load_fail_count = 0;
+    int static_ok_count = 0;
+    int static_fail_count = 0;
+    int total_undefined = 0;
+    int total_missing = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        const std::string& name = names[i];
+
+        std::string path =
+            std::string(kNativeDir) + "/" + name;
+
+        append_log(("BATCH [" + std::to_string(i + 1) + "/" +
+                    std::to_string(count) + "] " + name +
+                   " : lazy load start").c_str());
+
+        void* handle =
+            solder_dlopen(
+                name.c_str(),
+                SOLDER_LAZY | SOLDER_NO_AUTOLOAD
+            );
+
+        const char* load_err = solder_dlerror();
+
+        if (!handle) {
+            ++load_fail_count;
+            result += name + " : LOAD FAIL\n";
+            append_logf(
+                ("BATCH " + name + " : LOAD FAIL: %s").c_str(),
+                load_err ? load_err : "(no error text)"
+            );
+            continue;
+        }
+
+        ++load_ok_count;
+
+        std::string symbol_screen;
+        std::string symbol_full;
+        const bool symbols_ok =
+            inspect_undefined_symbols(
+                path.c_str(),
+                symbol_screen,
+                symbol_full
+            );
+
+        if (!symbols_ok) {
+            ++static_fail_count;
+            result += name + " : LOAD OK / SYMBOL INSPECT FAIL\n";
+            append_logf(
+                ("BATCH " + name + " : symbol inspection FAILED: %s").c_str(),
+                symbol_full.c_str()
+            );
+        } else {
+            ++static_ok_count;
+
+            int undef = 0;
+            int missing = 0;
+            const std::string prefix = "UNDEFINED COUNT: ";
+            if (symbol_full.rfind(prefix, 0) == 0) {
+                const size_t nl = symbol_full.find('\n');
+                if (nl != std::string::npos) {
+                    undef = std::atoi(
+                        symbol_full.substr(prefix.size(), nl - prefix.size()).c_str()
+                    );
+                }
+            }
+
+            size_t pos = 0;
+            while ((pos = symbol_full.find("    MISSING", pos)) != std::string::npos) {
+                ++missing;
+                pos += 12;
+            }
+
+            total_undefined += undef;
+            total_missing += missing;
+
+            result +=
+                name +
+                " : LOAD OK / undefined=" +
+                std::to_string(undef) +
+                " missing=" +
+                std::to_string(missing) +
+                "\n";
+
+            char batch_line[192];
+            std::snprintf(
+                batch_line,
+                sizeof(batch_line),
+                "BATCH %s : LOAD OK undefined=%d missing=%d",
+                name.c_str(),
+                undef,
+                missing
+            );
+            append_log(batch_line);
+
+            // The helper already marks every symbol DEFAULT/MISSING.
+            // Keep the full list in the debug log for the compatibility pass.
+            append_log(("BATCH " + name + " : STATIC SYMBOLS").c_str());
+            append_log(symbol_full.c_str());
+        }
+
+        solder_dlclose(handle);
+        const char* close_err = solder_dlerror();
+        if (close_err) {
+            append_logf(
+                ("BATCH " + name + " : close warning: %s").c_str(),
+                close_err
+            );
+        }
+    }
+
+    char summary[256];
+    std::snprintf(
+        summary,
+        sizeof(summary),
+        "BATCH SUMMARY: files=%zu load_ok=%d load_fail=%d symbol_ok=%d symbol_fail=%d total_undefined=%d total_missing=%d",
+        count,
+        load_ok_count,
+        load_fail_count,
+        static_ok_count,
+        static_fail_count,
+        total_undefined,
+        total_missing
+    );
+
+    append_log(summary);
+    result += "\n";
+    result += summary;
+}
+
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
+    consoleInit(nullptr);
+    socketInitializeDefault();
+
+    mkdir(kRoot, 0777);
+
+    append_log("GameNative NX 0.2.0 started");
+    append_log("MODE: batch ARM64 .so audit");
+
+    const bool solder_ok = init_solder();
+
+    PadState pad;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&pad);
+
+    bool audited = false;
+    std::string audit_result;
+
+    while (appletMainLoop()) {
+        draw_header();
+
+        std::printf(
+            "BATCH ARM64 AUDIT\n\n"
+            "This pass loads every ARM64 .so with:\n"
+            "  SOLDER_LAZY | SOLDER_NO_AUTOLOAD\n\n"
+            "It does NOT call dlsym on arbitrary exports and\n"
+            "does NOT execute JNI functions.\n\n"
+        );
+
+        std::printf(
+            "Native dir : %s\n",
+            exists(kNativeDir) ? "FOUND" : "MISSING"
+        );
+
+        std::printf(
+            "ARM64 .so : %zu\n",
+            count_entries(kNativeDir, ".so")
+        );
+
+        std::printf(
+            "libsolder  : %s\n\n",
+            solder_ok ? "READY" : "FAILED"
+        );
+
+        std::printf(
+            "A = Run batch audit\n"
+            "+ = Exit\n\n"
+        );
+
+        if (audited) {
+            std::printf(
+                "============================================================\n"
+                "RESULT\n"
+                "============================================================\n"
+                "%s\n",
+                audit_result.c_str()
+            );
+        }
+
+        consoleUpdate(nullptr);
+        padUpdate(&pad);
+
+        const u64 buttons = padGetButtonsDown(&pad);
+
+        if ((buttons & HidNpadButton_Plus) != 0)
+            break;
+
+        if ((buttons & HidNpadButton_A) != 0 &&
+            solder_ok &&
+            !audited) {
+
+            batch_audit_all_sos(audit_result);
+            audited = true;
+        }
+
+        svcSleepThread(16'000'000ULL);
+    }
+
+    if (solder_ok)
+        solder_quit();
+
+    socketExit();
+    consoleExit(nullptr);
+    return 0;
+}
+
     consoleInit(nullptr);
     socketInitializeDefault();
 
