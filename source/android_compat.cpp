@@ -985,6 +985,14 @@ extern "C" int gn_android_open_2(const char* path, int flags) {
 }
 
 extern "C" int gn_android_openat(int dirfd, const char* path, int flags, ...) {
+    // newlib/libnx does not provide openat(2).  Support the common Android
+    // case (AT_FDCWD) by falling back to open(2); reject true dirfd-relative
+    // paths until we have a dedicated path translation layer.
+    if (dirfd != AT_FDCWD) {
+        errno = ENOSYS;
+        return -1;
+    }
+
     mode_t mode = 0666;
     if (flags & O_CREAT) {
         va_list ap;
@@ -992,7 +1000,7 @@ extern "C" int gn_android_openat(int dirfd, const char* path, int flags, ...) {
         mode = static_cast<mode_t>(va_arg(ap, int));
         va_end(ap);
     }
-    return ::openat(dirfd, path, flags, mode);
+    return ::open(path, flags, mode);
 }
 
 extern "C" int gn_android_fcntl(int fd, int cmd, ...) {
@@ -1024,16 +1032,29 @@ extern "C" int gn_android_fchmod(int fd, mode_t mode) {
     return ::fchmod(fd, mode);
 }
 extern "C" int gn_android_fchmodat(int dirfd, const char* path, mode_t mode, int flags) {
-    return ::fchmodat(dirfd, path, mode, flags);
+    if (dirfd != AT_FDCWD || flags != 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ::chmod(path, mode);
 }
 extern "C" int gn_android_unlinkat(int dirfd, const char* path, int flags) {
-    return ::unlinkat(dirfd, path, flags);
+    if (dirfd != AT_FDCWD || flags != 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return ::unlink(path);
 }
 extern "C" int gn_android_truncate(const char* path, off_t length) {
     return ::truncate(path, length);
 }
 extern "C" int gn_android_utimensat(int dirfd, const char* path, const struct timespec times[2], int flags) {
-    return ::utimensat(dirfd, path, times, flags);
+    (void)dirfd;
+    (void)path;
+    (void)times;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
 }
 extern "C" long gn_android_pathconf(const char* path, int name) {
     return ::pathconf(path, name);
@@ -1053,7 +1074,10 @@ extern "C" char* gn_android_realpath(const char* path, char* resolved) {
 extern "C" DIR* gn_android_opendir(const char* path) { return ::opendir(path); }
 extern "C" struct dirent* gn_android_readdir(DIR* dir) { return ::readdir(dir); }
 extern "C" int gn_android_closedir(DIR* dir) { return ::closedir(dir); }
-extern "C" DIR* gn_android_fdopendir(int fd) { return ::fdopendir(fd); }
+extern "C" DIR* gn_android_fdopendir(int /*fd*/) {
+    errno = ENOSYS;
+    return nullptr;
+}
 
 extern "C" int gn_android_fseeko(FILE* stream, off_t offset, int whence) {
     return ::fseeko(stream, offset, whence);
@@ -1150,8 +1174,14 @@ extern "C" char* gn_android_strrchr2(const char* a, int b) { return const_cast<c
 extern "C" size_t gn_android_strcspn(const char* a, const char* b) { return std::strcspn(a, b); }
 
 extern "C" int gn_android_posix_memalign(void** memptr, size_t alignment, size_t size) {
-    if (!memptr || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) return EINVAL;
-    return ::posix_memalign(memptr, alignment, size);
+    // Keep this as a resolution-only compatibility shim for now.  libnx's
+    // internal aligned allocator has a different ownership/freeing contract,
+    // so do not return memory that a normal free() cannot safely release.
+    if (!memptr || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0)
+        return EINVAL;
+    *memptr = nullptr;
+    (void)size;
+    return ENOSYS;
 }
 extern "C" int gn_android_gettimeofday(struct timeval* tv, void* tz) {
     return ::gettimeofday(tv, static_cast<struct timezone*>(tz));
