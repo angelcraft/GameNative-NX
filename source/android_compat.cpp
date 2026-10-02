@@ -421,7 +421,9 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 // returned to Android code, while writes are redirected to the hidden peer.
 // This provides a real fd that participates in poll/epoll and can be cleaned
 // up without leaking the paired descriptor. It is a compatibility bridge, not
-// a full kernel-accurate eventfd counter/semaphore implementation.
+// a full kernel-accurate eventfd counter/semaphore implementation. This build
+// also logs each failure stage so the Switch runtime tells us whether the next
+// blocker is socketpair(), fcntl(), slot allocation, or initial value setup.
 
 extern "C" void* gn_android_mmap(
     void* /*addr*/,
@@ -479,27 +481,104 @@ extern "C" int gn_android_eventfd(
 ) {
     int socket_fds[2] = {-1, -1};
 
+    std::printf(
+        "[GameNative NX] eventfd: enter initval=%u flags=0x%x\n",
+        initval,
+        static_cast<unsigned int>(flags)
+    );
+
     // libnx exposes socketpair() through its BSD socket compatibility layer,
     // whereas pipe() is not available as a linkable symbol in the current
     // devkit/libnx environment used by this project.
-    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, socket_fds) != 0)
+    const int socketpair_rc =
+        ::socketpair(AF_UNIX, SOCK_STREAM, 0, socket_fds);
+
+    if (socketpair_rc != 0) {
+        const int saved_errno = errno;
+        std::printf(
+            "[GameNative NX] eventfd: socketpair FAILED rc=%d errno=%d\n",
+            socketpair_rc,
+            saved_errno
+        );
+        errno = saved_errno;
         return -1;
+    }
+
+    std::printf(
+        "[GameNative NX] eventfd: socketpair OK read_fd=%d write_fd=%d\n",
+        socket_fds[0],
+        socket_fds[1]
+    );
 
     if (flags & kAndroidEfdNonblock) {
         const int read_flags = ::fcntl(socket_fds[0], F_GETFL, 0);
-        const int write_flags = ::fcntl(socket_fds[1], F_GETFL, 0);
-
-        if (read_flags < 0 || write_flags < 0 ||
-            ::fcntl(socket_fds[0], F_SETFL, read_flags | O_NONBLOCK) != 0 ||
-            ::fcntl(socket_fds[1], F_SETFL, write_flags | O_NONBLOCK) != 0) {
+        if (read_flags < 0) {
+            const int saved_errno = errno;
+            std::printf(
+                "[GameNative NX] eventfd: fcntl(read,F_GETFL) FAILED fd=%d errno=%d\n",
+                socket_fds[0],
+                saved_errno
+            );
             ::close(socket_fds[0]);
             ::close(socket_fds[1]);
+            errno = saved_errno;
             return -1;
         }
+
+        const int write_flags = ::fcntl(socket_fds[1], F_GETFL, 0);
+        if (write_flags < 0) {
+            const int saved_errno = errno;
+            std::printf(
+                "[GameNative NX] eventfd: fcntl(write,F_GETFL) FAILED fd=%d errno=%d\n",
+                socket_fds[1],
+                saved_errno
+            );
+            ::close(socket_fds[0]);
+            ::close(socket_fds[1]);
+            errno = saved_errno;
+            return -1;
+        }
+
+        const int read_setfl_rc =
+            ::fcntl(socket_fds[0], F_SETFL, read_flags | O_NONBLOCK);
+        if (read_setfl_rc != 0) {
+            const int saved_errno = errno;
+            std::printf(
+                "[GameNative NX] eventfd: fcntl(read,F_SETFL) FAILED fd=%d errno=%d\n",
+                socket_fds[0],
+                saved_errno
+            );
+            ::close(socket_fds[0]);
+            ::close(socket_fds[1]);
+            errno = saved_errno;
+            return -1;
+        }
+
+        const int write_setfl_rc =
+            ::fcntl(socket_fds[1], F_SETFL, write_flags | O_NONBLOCK);
+        if (write_setfl_rc != 0) {
+            const int saved_errno = errno;
+            std::printf(
+                "[GameNative NX] eventfd: fcntl(write,F_SETFL) FAILED fd=%d errno=%d\n",
+                socket_fds[1],
+                saved_errno
+            );
+            ::close(socket_fds[0]);
+            ::close(socket_fds[1]);
+            errno = saved_errno;
+            return -1;
+        }
+
+        std::printf(
+            "[GameNative NX] eventfd: nonblock setup OK\n"
+        );
     }
 
     EventFdShim* shim = allocate_eventfd_shim();
     if (!shim) {
+        std::printf(
+            "[GameNative NX] eventfd: no free shim slots\n"
+        );
         ::close(socket_fds[0]);
         ::close(socket_fds[1]);
         errno = EMFILE;
@@ -519,13 +598,30 @@ extern "C" int gn_android_eventfd(
         );
 
         if (rc != static_cast<ssize_t>(sizeof(value))) {
+            const int saved_errno = errno;
+            std::printf(
+                "[GameNative NX] eventfd: initial send FAILED rc=%ld errno=%d\n",
+                static_cast<long>(rc),
+                saved_errno
+            );
             ::close(shim->read_fd);
             ::close(shim->write_fd);
             shim->read_fd = -1;
             shim->write_fd = -1;
+            errno = saved_errno;
             return -1;
         }
+
+        std::printf(
+            "[GameNative NX] eventfd: initial value queued=%u\n",
+            initval
+        );
     }
+
+    std::printf(
+        "[GameNative NX] eventfd: SUCCESS returned_fd=%d\n",
+        shim->read_fd
+    );
 
     return shim->read_fd;
 }
