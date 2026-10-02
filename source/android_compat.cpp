@@ -432,14 +432,23 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 // mmap / munmap / eventfd compatibility
 // ============================================================================
 //
-// mmap/munmap are still resolution-only placeholders. eventfd gets a small
-// functional compatibility layer backed by an AF_UNIX socketpair. One end is
-// returned to Android code, while writes are redirected to the hidden peer.
-// This provides a real fd that participates in poll/epoll and can be cleaned
-// up without leaking the paired descriptor. It is a compatibility bridge, not
-// a full kernel-accurate eventfd counter/semaphore implementation. This build
-// also logs each failure stage so the Switch runtime tells us whether the next
-// blocker is socketpair(), fcntl(), slot allocation, or initial value setup.
+// mmap/munmap are still resolution-only placeholders.
+//
+// eventfd cannot be implemented with Linux's eventfd syscall on Switch, and
+// libnx's socketpair(AF_UNIX, ...) is not available in the current runtime
+// (DIAG_V7 observed errno 88 / ENOTSOCK).  Instead we use a small in-process
+// eventfd shim with synthetic positive descriptors.
+//
+// The synthetic descriptors are handled by:
+//   - eventfd()          -> allocates a shim and returns a fake fd
+//   - read/write         -> operate on the shim's 64-bit counter
+//   - close()            -> releases the shim
+//   - epoll_wait()       -> treats a non-zero counter as EPOLLIN
+//
+// This is intentionally a compatibility bridge.  It implements the parts
+// needed by Winlator's synchronization paths without pretending to be a
+// kernel-perfect Linux eventfd implementation.
+//
 
 extern "C" void* gn_android_mmap(
     void* /*addr*/,
@@ -463,18 +472,28 @@ extern "C" int gn_android_munmap(
 
 constexpr size_t kMaxEventFdShims = 16;
 constexpr int kAndroidEfdNonblock = 0x00000800;
+constexpr int kAndroidEfdSemaphore = 0x00000001;
+constexpr uint64_t kEventFdMax = UINT64_MAX - 1;
+
+// Keep synthetic descriptors well outside the normal libnx fd range.
+constexpr int kFirstSyntheticEventFd = 0x40000000;
 
 struct EventFdShim {
-    int read_fd = -1;
-    int write_fd = -1;
+    bool used = false;
+    int fake_fd = -1;
+    uint64_t counter = 0;
+    int flags = 0;
 };
 
 static EventFdShim g_eventfd_shims[kMaxEventFdShims];
+static pthread_mutex_t g_eventfd_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 EventFdShim* find_eventfd_shim(int fd) {
     for (size_t i = 0; i < kMaxEventFdShims; ++i) {
-        if (g_eventfd_shims[i].read_fd == fd)
+        if (g_eventfd_shims[i].used &&
+            g_eventfd_shims[i].fake_fd == fd) {
             return &g_eventfd_shims[i];
+        }
     }
 
     return nullptr;
@@ -482,164 +501,69 @@ EventFdShim* find_eventfd_shim(int fd) {
 
 EventFdShim* allocate_eventfd_shim() {
     for (size_t i = 0; i < kMaxEventFdShims; ++i) {
-        if (g_eventfd_shims[i].read_fd < 0 &&
-            g_eventfd_shims[i].write_fd < 0) {
+        if (!g_eventfd_shims[i].used)
             return &g_eventfd_shims[i];
-        }
     }
 
     return nullptr;
+}
+
+int eventfd_synthetic_fd(size_t index) {
+    return kFirstSyntheticEventFd + static_cast<int>(index);
 }
 
 extern "C" int gn_android_eventfd(
     unsigned int initval,
     int flags
 ) {
-    int socket_fds[2] = {-1, -1};
-
     gn_eventfd_diag(
-        "[GameNative NX] eventfd: DIAG_V7 enter initval=%u flags=0x%x\n",
+        "[GameNative NX] eventfd: DIAG_V8 enter initval=%u flags=0x%x\n",
         initval,
         static_cast<unsigned int>(flags)
     );
 
-    // libnx exposes socketpair() through its BSD socket compatibility layer,
-    // whereas pipe() is not available as a linkable symbol in the current
-    // devkit/libnx environment used by this project.
-    const int socketpair_rc =
-        ::socketpair(AF_UNIX, SOCK_STREAM, 0, socket_fds);
+    if (flags &
+        ~(kAndroidEfdNonblock | kAndroidEfdSemaphore)) {
 
-    if (socketpair_rc != 0) {
-        const int saved_errno = errno;
         gn_eventfd_diag(
-            "[GameNative NX] eventfd: socketpair FAILED rc=%d errno=%d\n",
-            socketpair_rc,
-            saved_errno
+            "[GameNative NX] eventfd: unsupported flags=0x%x\n",
+            static_cast<unsigned int>(flags)
         );
-        errno = saved_errno;
+        errno = EINVAL;
         return -1;
     }
 
-    gn_eventfd_diag(
-        "[GameNative NX] eventfd: socketpair OK read_fd=%d write_fd=%d\n",
-        socket_fds[0],
-        socket_fds[1]
-    );
-
-    if (flags & kAndroidEfdNonblock) {
-        const int read_flags = ::fcntl(socket_fds[0], F_GETFL, 0);
-        if (read_flags < 0) {
-            const int saved_errno = errno;
-            gn_eventfd_diag(
-                "[GameNative NX] eventfd: fcntl(read,F_GETFL) FAILED fd=%d errno=%d\n",
-                socket_fds[0],
-                saved_errno
-            );
-            ::close(socket_fds[0]);
-            ::close(socket_fds[1]);
-            errno = saved_errno;
-            return -1;
-        }
-
-        const int write_flags = ::fcntl(socket_fds[1], F_GETFL, 0);
-        if (write_flags < 0) {
-            const int saved_errno = errno;
-            gn_eventfd_diag(
-                "[GameNative NX] eventfd: fcntl(write,F_GETFL) FAILED fd=%d errno=%d\n",
-                socket_fds[1],
-                saved_errno
-            );
-            ::close(socket_fds[0]);
-            ::close(socket_fds[1]);
-            errno = saved_errno;
-            return -1;
-        }
-
-        const int read_setfl_rc =
-            ::fcntl(socket_fds[0], F_SETFL, read_flags | O_NONBLOCK);
-        if (read_setfl_rc != 0) {
-            const int saved_errno = errno;
-            gn_eventfd_diag(
-                "[GameNative NX] eventfd: fcntl(read,F_SETFL) FAILED fd=%d errno=%d\n",
-                socket_fds[0],
-                saved_errno
-            );
-            ::close(socket_fds[0]);
-            ::close(socket_fds[1]);
-            errno = saved_errno;
-            return -1;
-        }
-
-        const int write_setfl_rc =
-            ::fcntl(socket_fds[1], F_SETFL, write_flags | O_NONBLOCK);
-        if (write_setfl_rc != 0) {
-            const int saved_errno = errno;
-            gn_eventfd_diag(
-                "[GameNative NX] eventfd: fcntl(write,F_SETFL) FAILED fd=%d errno=%d\n",
-                socket_fds[1],
-                saved_errno
-            );
-            ::close(socket_fds[0]);
-            ::close(socket_fds[1]);
-            errno = saved_errno;
-            return -1;
-        }
-
-        gn_eventfd_diag(
-            "[GameNative NX] eventfd: nonblock setup OK\n"
-        );
-    }
+    pthread_mutex_lock(&g_eventfd_mutex);
 
     EventFdShim* shim = allocate_eventfd_shim();
     if (!shim) {
+        pthread_mutex_unlock(&g_eventfd_mutex);
         gn_eventfd_diag(
             "[GameNative NX] eventfd: no free shim slots\n"
         );
-        ::close(socket_fds[0]);
-        ::close(socket_fds[1]);
         errno = EMFILE;
         return -1;
     }
 
-    shim->read_fd = socket_fds[0];
-    shim->write_fd = socket_fds[1];
+    const size_t index =
+        static_cast<size_t>(shim - g_eventfd_shims);
 
-    if (initval != 0) {
-        const uint64_t value = initval;
-        const ssize_t rc = ::send(
-            shim->write_fd,
-            &value,
-            sizeof(value),
-            0
-        );
+    shim->used = true;
+    shim->fake_fd = eventfd_synthetic_fd(index);
+    shim->counter = initval;
+    shim->flags = flags;
 
-        if (rc != static_cast<ssize_t>(sizeof(value))) {
-            const int saved_errno = errno;
-            gn_eventfd_diag(
-                "[GameNative NX] eventfd: initial send FAILED rc=%ld errno=%d\n",
-                static_cast<long>(rc),
-                saved_errno
-            );
-            ::close(shim->read_fd);
-            ::close(shim->write_fd);
-            shim->read_fd = -1;
-            shim->write_fd = -1;
-            errno = saved_errno;
-            return -1;
-        }
+    const int result_fd = shim->fake_fd;
 
-        gn_eventfd_diag(
-            "[GameNative NX] eventfd: initial value queued=%u\n",
-            initval
-        );
-    }
+    pthread_mutex_unlock(&g_eventfd_mutex);
 
     gn_eventfd_diag(
-        "[GameNative NX] eventfd: SUCCESS returned_fd=%d\n",
-        shim->read_fd
+        "[GameNative NX] eventfd: SUCCESS synthetic_fd=%d counter=%llu\n",
+        result_fd,
+        static_cast<unsigned long long>(initval)
     );
 
-    return shim->read_fd;
+    return result_fd;
 }
 
 extern "C" ssize_t gn_android_eventfd_read(
@@ -647,11 +571,50 @@ extern "C" ssize_t gn_android_eventfd_read(
     void* buf,
     size_t count
 ) {
-    EventFdShim* shim = find_eventfd_shim(fd);
-    if (!shim)
-        return ::read(fd, buf, count);
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
 
-    return ::recv(shim->read_fd, buf, count, 0);
+    pthread_mutex_lock(&g_eventfd_mutex);
+
+    EventFdShim* shim = find_eventfd_shim(fd);
+    if (!shim) {
+        pthread_mutex_unlock(&g_eventfd_mutex);
+        return ::read(fd, buf, count);
+    }
+
+    if (count != sizeof(uint64_t)) {
+        pthread_mutex_unlock(&g_eventfd_mutex);
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (shim->counter == 0) {
+        const bool nonblock =
+            (shim->flags & kAndroidEfdNonblock) != 0;
+        pthread_mutex_unlock(&g_eventfd_mutex);
+
+        // Blocking eventfd reads are not yet backed by a wait queue.  Return
+        // EAGAIN for both modes so a caller cannot hang the Switch process.
+        (void)nonblock;
+        errno = EAGAIN;
+        return -1;
+    }
+
+    uint64_t value;
+    if (shim->flags & kAndroidEfdSemaphore) {
+        value = 1;
+        --shim->counter;
+    } else {
+        value = shim->counter;
+        shim->counter = 0;
+    }
+
+    pthread_mutex_unlock(&g_eventfd_mutex);
+
+    std::memcpy(buf, &value, sizeof(value));
+    return static_cast<ssize_t>(sizeof(value));
 }
 
 extern "C" ssize_t gn_android_eventfd_write(
@@ -659,36 +622,59 @@ extern "C" ssize_t gn_android_eventfd_write(
     const void* buf,
     size_t count
 ) {
-    EventFdShim* shim = find_eventfd_shim(fd);
-    if (!shim)
-        return ::write(fd, buf, count);
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
 
-    return ::send(shim->write_fd, buf, count, 0);
+    pthread_mutex_lock(&g_eventfd_mutex);
+
+    EventFdShim* shim = find_eventfd_shim(fd);
+    if (!shim) {
+        pthread_mutex_unlock(&g_eventfd_mutex);
+        return ::write(fd, buf, count);
+    }
+
+    if (count != sizeof(uint64_t)) {
+        pthread_mutex_unlock(&g_eventfd_mutex);
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t value;
+    std::memcpy(&value, buf, sizeof(value));
+
+    if (value == UINT64_MAX ||
+        shim->counter > (kEventFdMax - value)) {
+
+        pthread_mutex_unlock(&g_eventfd_mutex);
+        errno = EAGAIN;
+        return -1;
+    }
+
+    shim->counter += value;
+
+    pthread_mutex_unlock(&g_eventfd_mutex);
+
+    return static_cast<ssize_t>(sizeof(value));
 }
 
 extern "C" int gn_android_close(
     int fd
 ) {
+    pthread_mutex_lock(&g_eventfd_mutex);
+
     EventFdShim* shim = find_eventfd_shim(fd);
-    if (!shim)
+    if (!shim) {
+        pthread_mutex_unlock(&g_eventfd_mutex);
         return ::close(fd);
+    }
 
-    const int read_fd = shim->read_fd;
-    const int write_fd = shim->write_fd;
+    *shim = {};
+    pthread_mutex_unlock(&g_eventfd_mutex);
 
-    shim->read_fd = -1;
-    shim->write_fd = -1;
-
-    const int read_rc = ::close(read_fd);
-    const int write_rc = ::close(write_fd);
-
-    if (read_rc != 0)
-        return read_rc;
-
-    return write_rc;
+    return 0;
 }
-
-
 
 // ============================================================================
 // Dynamic-loader compatibility
@@ -1067,102 +1053,140 @@ extern "C" int gn_android_epoll_wait(
         return -1;
     }
 
-    pollfd poll_fds[
-        kMaxEpollWatches
-    ];
+    // The epoll shim uses native poll() for real descriptors, but synthetic
+    // eventfd descriptors are handled entirely in-process.
+    pollfd poll_fds[kMaxEpollWatches];
+    EpollWatch* watch_map[kMaxEpollWatches];
 
-    EpollWatch* watch_map[
-        kMaxEpollWatches
-    ];
+    for (;;) {
+        gn_epoll_event* out_events =
+            static_cast<gn_epoll_event*>(events_ptr);
 
-    int poll_count = 0;
+        int output_count = 0;
+        int poll_count = 0;
 
-    for (int i = 0;
-         i < kMaxEpollWatches;
-         ++i) {
+        for (int i = 0;
+             i < kMaxEpollWatches;
+             ++i) {
 
-        EpollWatch& watch =
-            ep->watches[i];
+            EpollWatch& watch =
+                ep->watches[i];
 
-        if (!watch.used)
-            continue;
+            if (!watch.used)
+                continue;
 
-        if (poll_count >=
-            kMaxEpollWatches) {
+            if (find_eventfd_shim(watch.fd)) {
+                bool ready = false;
 
-            break;
+                pthread_mutex_lock(&g_eventfd_mutex);
+                EventFdShim* shim =
+                    find_eventfd_shim(watch.fd);
+
+                if (shim &&
+                    shim->counter != 0 &&
+                    (watch.events & (
+                        GN_EPOLLIN |
+                        GN_EPOLLRDNORM |
+                        GN_EPOLLPRI))) {
+                    ready = true;
+                }
+
+                pthread_mutex_unlock(&g_eventfd_mutex);
+
+                if (ready &&
+                    output_count < maxevents) {
+
+                    gn_epoll_event out =
+                        watch.user_event;
+
+                    out.events = 0;
+                    if (watch.events & (
+                            GN_EPOLLIN |
+                            GN_EPOLLRDNORM)) {
+                        out.events |= GN_EPOLLIN;
+                    }
+                    if (watch.events & GN_EPOLLPRI) {
+                        out.events |= GN_EPOLLPRI;
+                    }
+
+                    out_events[output_count++] =
+                        out;
+                }
+
+                continue;
+            }
+
+            if (poll_count >= kMaxEpollWatches)
+                break;
+
+            poll_fds[poll_count] = {};
+            poll_fds[poll_count].fd = watch.fd;
+            poll_fds[poll_count].events =
+                epoll_to_poll_events(watch.events);
+            watch_map[poll_count] = &watch;
+            ++poll_count;
         }
 
-        poll_fds[poll_count] = {};
+        if (output_count > 0)
+            return output_count;
 
-        poll_fds[poll_count].fd =
-            watch.fd;
+        int slice_ms = 0;
 
-        poll_fds[poll_count].events =
-            epoll_to_poll_events(
-                watch.events
+        if (timeout < 0) {
+            slice_ms = 10;
+        } else if (timeout == 0) {
+            slice_ms = 0;
+        } else {
+            slice_ms = timeout < 10 ? timeout : 10;
+        }
+
+        const int ready =
+            ::poll(
+                poll_count > 0 ? poll_fds : nullptr,
+                static_cast<nfds_t>(poll_count),
+                slice_ms
             );
 
-        watch_map[poll_count] =
-            &watch;
+        if (ready < 0)
+            return -1;
 
-        ++poll_count;
+        if (ready > 0) {
+            for (int i = 0;
+                 i < poll_count &&
+                 output_count < maxevents;
+                 ++i) {
+
+                if (!poll_fds[i].revents)
+                    continue;
+
+                EpollWatch* watch =
+                    watch_map[i];
+
+                gn_epoll_event out =
+                    watch->user_event;
+
+                out.events =
+                    poll_to_epoll_events(
+                        poll_fds[i].revents
+                    );
+
+                out_events[output_count++] =
+                    out;
+            }
+
+            if (output_count > 0)
+                return output_count;
+        }
+
+        if (timeout == 0)
+            return 0;
+
+        if (timeout > 0) {
+            timeout -= slice_ms;
+            if (timeout <= 0)
+                return 0;
+        }
     }
-
-    if (poll_count == 0) {
-        return ::poll(
-            nullptr,
-            0,
-            timeout
-        );
-    }
-
-    const int ready =
-        ::poll(
-            poll_fds,
-            static_cast<nfds_t>(
-                poll_count
-            ),
-            timeout
-        );
-
-    if (ready <= 0)
-        return ready;
-
-    gn_epoll_event* out_events =
-        static_cast<gn_epoll_event*>(
-            events_ptr
-        );
-
-    int output_count = 0;
-
-    for (int i = 0;
-         i < poll_count &&
-         output_count < maxevents;
-         ++i) {
-
-        if (!poll_fds[i].revents)
-            continue;
-
-        EpollWatch* watch =
-            watch_map[i];
-
-        gn_epoll_event out =
-            watch->user_event;
-
-        out.events =
-            poll_to_epoll_events(
-                poll_fds[i].revents
-            );
-
-        out_events[
-            output_count
-        ] = out;
-
-        ++output_count;
-    }
-
-    return output_count;
 }
 
 
