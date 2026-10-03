@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <locale.h>
+#include <signal.h>
 #include <pthread.h>
 #include <time.h>
 #include <wctype.h>
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cmath>
 
 #ifndef GN_CMSG_ALIGN
 #define GN_CMSG_ALIGN(len) \
@@ -1347,6 +1349,47 @@ extern "C" int gn_android_vsscanf(const char* s, const char* fmt, va_list ap) { 
 //
 // Do not call them yet. A later step will replace these with real shims.
 //
+// ============================================================================
+// Additional libc compatibility symbols discovered by relocation smoke tests.
+// ============================================================================
+
+extern "C" int gn_android_alphasort(
+    const struct dirent** a,
+    const struct dirent** b
+) {
+    if (!a || !b || !*a || !*b) {
+        errno = EINVAL;
+        return 0;
+    }
+    return std::strcmp((*a)->d_name, (*b)->d_name);
+}
+
+extern "C" int gn_android_sigaction(
+    int /*signum*/,
+    const struct sigaction* /*act*/,
+    struct sigaction* /*oldact*/
+) {
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" void gn_android_sincos(
+    double x,
+    double* s,
+    double* c
+) {
+    if (s)
+        *s = std::sin(x);
+    if (c)
+        *c = std::cos(x);
+}
+
+// Android/Bionic exports optarg as an OBJECT.
+extern "C" char* gn_android_optarg = nullptr;
+
+// Resolution-only compatibility object for Bionic's __sF FILE array.
+extern "C" FILE gn_android_sF[3] = {};
+
 extern "C" uintptr_t gn_android_unimplemented(...) {
     errno = ENOSYS;
     return 0;
@@ -1779,6 +1822,13 @@ static const solder_export_t kAndroidCompatExports[] = {
         "qsort",
         (void*)&gn_android_qsort
     ),
+
+    // Relocation-discovered libc symbols.
+    SOLDER_EXPORT("alphasort", (void*)&gn_android_alphasort),
+    SOLDER_EXPORT("sigaction", (void*)&gn_android_sigaction),
+    SOLDER_EXPORT("sincos", (void*)&gn_android_sincos),
+    SOLDER_EXPORT("optarg", (void*)&gn_android_optarg),
+    SOLDER_EXPORT("__sF", (void*)gn_android_sF),
 
     SOLDER_EXPORT(
         "fgetws",
