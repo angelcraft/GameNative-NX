@@ -17,30 +17,31 @@ jobs:
     steps:
       - name: Checkout GameNative NX
         uses: actions/checkout@v4
+
       - name: Show toolchain
         shell: bash
         run: |
           set -euo pipefail
-
+          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
           echo "DEVKITPRO=$DEVKITPRO"
           echo "devkitA64=$DEVKITPRO/devkitA64"
-
           test -d "$DEVKITPRO/devkitA64"
           test -f "$DEVKITPRO/libnx/switch_rules"
-          test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++"
+          command -v make
+          command -v aarch64-none-elf-g++
 
-          echo "make:"
-          make --version
-
-          echo "compiler:"
-          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++" --version | head -1
-      
       - name: Fetch libsolder
         shell: bash
         run: |
           set -euo pipefail
           rm -rf third_party/libsolder
           git clone --depth 1 https://github.com/fgsfdsfgs/libsolder.git third_party/libsolder
+
+      - name: Patch libsolder relocation-failure handling
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tools/fix_libsolder_reloc_safety.sh
 
       - name: Check required Switch headers and libraries
         shell: bash
