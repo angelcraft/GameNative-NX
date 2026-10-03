@@ -23,12 +23,14 @@ jobs:
         run: |
           set -euo pipefail
           export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+          export PATH="$DEVKITPRO/devkitA64/bin:$PATH"
           echo "DEVKITPRO=$DEVKITPRO"
           echo "devkitA64=$DEVKITPRO/devkitA64"
           test -d "$DEVKITPRO/devkitA64"
           test -f "$DEVKITPRO/libnx/switch_rules"
           command -v make
-          command -v aarch64-none-elf-g++
+          test -x "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++"
+          "$DEVKITPRO/devkitA64/bin/aarch64-none-elf-g++" --version | sed -n '1p'
 
       - name: Fetch libsolder
         shell: bash
