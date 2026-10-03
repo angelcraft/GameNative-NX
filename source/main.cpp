@@ -2,8 +2,6 @@
 #include <solder.h>
 #include "android_compat.hpp"
 
-extern "C" int solder_debug_relocate_all(void* handle);
-
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -11,6 +9,8 @@ extern "C" int solder_debug_relocate_all(void* handle);
 #include <string>
 #include <elf.h>
 #include <cstdint>
+
+extern "C" void* solder_lookup_global(const char* symname);
 
 namespace {
 
@@ -1896,16 +1896,16 @@ void batch_audit_all_sos(std::string& result) {
     result.clear();
 
     append_log("============================================================");
-    append_log("BATCH AUDIT V5: preload bundled dependencies + BULK relocation diagnostics");
+    append_log("BATCH AUDIT V6: complete undefined-symbol inventory");
     append_log("All ARM64 .so files are loaded first with lazy auto-dependency discovery.");
-    append_log("Then every loaded module is forced through a non-initializing relocation pass.");
-    append_log("No arbitrary exported functions or init routines are called by the diagnostic.");
+    append_log("Then every DT_NEEDED-visible symbol is checked against the live global loader namespace.");
+    append_log("No relocation pass, constructors, or arbitrary exported functions are executed.");
     append_log("============================================================");
 
     DIR* dir = opendir(kNativeDir);
     if (!dir) {
         result = "FAILED: cannot open native directory\n";
-        append_log("BATCH AUDIT V3: opendir FAILED");
+        append_log("BATCH AUDIT V6: opendir FAILED");
         return;
     }
 
@@ -1950,10 +1950,8 @@ void batch_audit_all_sos(std::string& result) {
     result += "Found " + std::to_string(count) + " ARM64 .so files\n\n";
 
     // Phase 1: preload every bundled module and KEEP it alive.
-    // IMPORTANT: allow libsolder to scan DT_NEEDED dependencies.
-    // Dependencies are linked into the global module list only after
-    // relocation, so SOLDER_NO_AUTOLOAD would make their symbols invisible
-    // to solder_lookup_global().
+    // We intentionally allow DT_NEEDED dependency discovery so the live
+    // global namespace contains bundled providers such as libpulsecommon.so.
     for (size_t i = 0; i < count; ++i) {
         const std::string& name = names[i];
 
@@ -1961,11 +1959,7 @@ void batch_audit_all_sos(std::string& result) {
                     std::to_string(count) + "] " + name +
                     " : starting").c_str());
 
-        void* handle = solder_dlopen(
-            name.c_str(),
-            SOLDER_LAZY
-        );
-
+        void* handle = solder_dlopen(name.c_str(), SOLDER_LAZY);
         const char* load_err = solder_dlerror();
 
         if (!handle) {
@@ -1988,60 +1982,256 @@ void batch_audit_all_sos(std::string& result) {
                 " loaded=" + std::to_string(loaded_count) +
                 " failed=" + std::to_string(load_fail_count)).c_str());
 
-    // Phase 2: BULK relocation diagnostic.
-    // Instead of dlsym()-ing one symbol per module (which stops at the first
-    // unresolved import), ask libsolder to run a non-initializing relocation
-    // pass with ignore_undef=1. libsolder will continue through ALL RELA/JMPREL
-    // entries and DEBUG_PRINTF every unresolved symbol.
-    int bulk_reloc_ok = 0;
-    int bulk_reloc_fail = 0;
+    // Phase 2: parse each ELF's .dynsym/.dynstr directly. For every unique
+    // undefined symbol, ask the live libsolder global namespace whether a
+    // provider exists. This is much faster and safer than forcing relocation
+    // one import at a time, and it gives us the COMPLETE inventory in one run.
+    size_t total_undefined = 0;
+    size_t unique_missing_total = 0;
+    size_t unique_resolved_total = 0;
+    size_t unique_modules_scanned = 0;
 
-    append_log("BULK RELOC: begin all-modules relocation with unresolved-import logging");
+    struct SymbolStat {
+        std::string name;
+        size_t missing_occurrences;
+        size_t resolved_occurrences;
+    };
+    SymbolStat* global_stats = new SymbolStat[4096];
+    size_t global_stat_count = 0;
 
-    for (size_t i = 0; i < loaded_count; ++i) {
-        const std::string& name = loaded[i].name;
+    append_log("SYMBOL INVENTORY: begin live global-namespace scan");
 
-        append_log(("BULK RELOC [" + std::to_string(i + 1) + "/" +
-                    std::to_string(loaded_count) + "] " + name +
-                    " : starting").c_str());
+    for (size_t mi = 0; mi < loaded_count; ++mi) {
+        const std::string& name = loaded[mi].name;
+        const std::string path = std::string(kNativeDir) + "/" + name;
 
-        const int rc = solder_debug_relocate_all(loaded[i].handle);
+        FILE* fp = std::fopen(path.c_str(), "rb");
+        if (!fp) {
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED open").c_str());
+            continue;
+        }
 
-        if (rc == 0) {
-            ++bulk_reloc_ok;
-            append_log(("BULK RELOC " + name + " : OK (all unresolved imports were logged)").c_str());
-            result += "BULK RELOC OK: " + name + "\n";
-        } else {
-            ++bulk_reloc_fail;
-            append_log(("BULK RELOC " + name + " : FAILED rc=" +
-                        std::to_string(rc)).c_str());
-            result += "BULK RELOC FAIL: " + name + " rc=" +
-                      std::to_string(rc) + "\n";
+        Elf64_Ehdr ehdr{};
+        if (std::fread(&ehdr, sizeof(ehdr), 1, fp) != 1 ||
+            std::memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+            ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED invalid ELF64").c_str());
+            std::fclose(fp);
+            continue;
+        }
+
+        if (ehdr.e_shnum == 0 || ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED section table").c_str());
+            std::fclose(fp);
+            continue;
+        }
+
+        Elf64_Shdr* shdrs = new Elf64_Shdr[ehdr.e_shnum];
+        if (!shdrs) {
+            std::fclose(fp);
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED alloc section table").c_str());
+            continue;
+        }
+
+        std::fseek(fp, static_cast<long>(ehdr.e_shoff), SEEK_SET);
+        if (std::fread(shdrs, sizeof(Elf64_Shdr), ehdr.e_shnum, fp) != ehdr.e_shnum) {
+            delete[] shdrs;
+            std::fclose(fp);
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED read section table").c_str());
+            continue;
+        }
+
+        const Elf64_Shdr* dynsym_sh = nullptr;
+        const Elf64_Shdr* dynstr_sh = nullptr;
+        const Elf64_Shdr* shstr_sh = nullptr;
+
+        if (ehdr.e_shstrndx < ehdr.e_shnum)
+            shstr_sh = &shdrs[ehdr.e_shstrndx];
+
+        std::string section_names;
+        if (shstr_sh) {
+            section_names.resize(static_cast<size_t>(shstr_sh->sh_size));
+            std::fseek(fp, static_cast<long>(shstr_sh->sh_offset), SEEK_SET);
+            if (!section_names.empty())
+                std::fread(&section_names[0], 1, section_names.size(), fp);
+        }
+
+        for (int si = 0; si < ehdr.e_shnum; ++si) {
+            const char* sname = "";
+            if (shdrs[si].sh_name < section_names.size())
+                sname = section_names.c_str() + shdrs[si].sh_name;
+
+            if (!std::strcmp(sname, ".dynsym"))
+                dynsym_sh = &shdrs[si];
+            else if (!std::strcmp(sname, ".dynstr"))
+                dynstr_sh = &shdrs[si];
+        }
+
+        if (!dynsym_sh || !dynstr_sh) {
+            delete[] shdrs;
+            std::fclose(fp);
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED no dynsym/dynstr").c_str());
+            continue;
+        }
+
+        std::string dynstr(static_cast<size_t>(dynstr_sh->sh_size), '\0');
+        std::fseek(fp, static_cast<long>(dynstr_sh->sh_offset), SEEK_SET);
+        if (!dynstr.empty())
+            std::fread(&dynstr[0], 1, dynstr.size(), fp);
+
+        const size_t dynsym_count =
+            static_cast<size_t>(dynsym_sh->sh_size / sizeof(Elf64_Sym));
+        Elf64_Sym* dynsym = new Elf64_Sym[dynsym_count];
+        if (!dynsym) {
+            delete[] shdrs;
+            std::fclose(fp);
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED alloc dynsym").c_str());
+            continue;
+        }
+
+        std::fseek(fp, static_cast<long>(dynsym_sh->sh_offset), SEEK_SET);
+        if (std::fread(dynsym, sizeof(Elf64_Sym), dynsym_count, fp) != dynsym_count) {
+            delete[] dynsym;
+            delete[] shdrs;
+            std::fclose(fp);
+            append_log(("SYMBOL INVENTORY " + name + " : FAILED read dynsym").c_str());
+            continue;
+        }
+
+        std::string* seen = new std::string[4096];
+        size_t seen_count = 0;
+        size_t module_undef = 0;
+        size_t module_missing = 0;
+        size_t module_resolved = 0;
+
+        for (size_t si = 1; si < dynsym_count; ++si) {
+            const Elf64_Sym& sym = dynsym[si];
+            if (sym.st_shndx != SHN_UNDEF)
+                continue;
+            if (sym.st_name >= dynstr.size())
+                continue;
+
+            const char* symname = dynstr.c_str() + sym.st_name;
+            if (!symname[0])
+                continue;
+
+            bool duplicate = false;
+            for (size_t k = 0; k < seen_count; ++k) {
+                if (seen[k] == symname) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate)
+                continue;
+
+            if (seen_count < 4096)
+                seen[seen_count++] = symname;
+
+            ++module_undef;
+            ++total_undefined;
+
+            const bool resolved = solder_lookup_global(symname) != nullptr;
+            if (resolved) {
+                ++module_resolved;
+                ++unique_resolved_total;
+            } else {
+                ++module_missing;
+                ++unique_missing_total;
+
+                char line[512];
+                std::snprintf(
+                    line, sizeof(line),
+                    "UNRESOLVED module=%s symbol=%s bind=%u type=%u",
+                    name.c_str(), symname,
+                    static_cast<unsigned>(ELF64_ST_BIND(sym.st_info)),
+                    static_cast<unsigned>(ELF64_ST_TYPE(sym.st_info))
+                );
+                append_log(line);
+            }
+
+            size_t stat_idx = 0;
+            for (; stat_idx < global_stat_count; ++stat_idx) {
+                if (global_stats[stat_idx].name == symname)
+                    break;
+            }
+            if (stat_idx == global_stat_count && global_stat_count < 4096) {
+                global_stats[global_stat_count].name = symname;
+                global_stats[global_stat_count].missing_occurrences = 0;
+                global_stats[global_stat_count].resolved_occurrences = 0;
+                ++global_stat_count;
+            }
+            if (stat_idx < global_stat_count) {
+                if (resolved)
+                    ++global_stats[stat_idx].resolved_occurrences;
+                else
+                    ++global_stats[stat_idx].missing_occurrences;
+            }
+        }
+
+        char module_summary[256];
+        std::snprintf(
+            module_summary, sizeof(module_summary),
+            "SYMBOL INVENTORY %s : unique_undefined=%zu missing=%zu resolved=%zu",
+            name.c_str(), module_undef, module_missing, module_resolved
+        );
+        append_log(module_summary);
+
+        delete[] seen;
+        delete[] dynsym;
+        delete[] shdrs;
+        std::fclose(fp);
+        ++unique_modules_scanned;
+    }
+
+    // Sort global missing symbols by descending occurrence count for a compact
+    // actionable tail section in the log.
+    for (size_t i = 0; i < global_stat_count; ++i) {
+        for (size_t j = i + 1; j < global_stat_count; ++j) {
+            if (global_stats[j].missing_occurrences > global_stats[i].missing_occurrences) {
+                SymbolStat tmp = global_stats[i];
+                global_stats[i] = global_stats[j];
+                global_stats[j] = tmp;
+            }
         }
     }
 
-    append_log("BULK RELOC: finished; inspect libsolder resolution-failed lines for complete missing-import inventory");
+    append_log("============================================================");
+    append_log("UNRESOLVED SYMBOL SUMMARY: sorted by missing-module occurrences");
+    for (size_t i = 0; i < global_stat_count; ++i) {
+        if (!global_stats[i].missing_occurrences)
+            continue;
 
-    // DIAGNOSTIC MODE: do not dlclose here.
-    // This keeps the test isolated from refcount/unload behavior.
-    // The process exit will reclaim the mapped modules.
-    append_log("CLOSE: skipped (diagnostic mode; process exit will reclaim modules)");
+        char line[512];
+        std::snprintf(
+            line, sizeof(line),
+            "MISSING symbol=%s occurrences=%zu also_resolved_occurrences=%zu",
+            global_stats[i].name.c_str(),
+            global_stats[i].missing_occurrences,
+            global_stats[i].resolved_occurrences
+        );
+        append_log(line);
+    }
 
-    char summary[256];
+    char summary[512];
     std::snprintf(
-        summary,
-        sizeof(summary),
-        "BATCH V5 SUMMARY: files=%zu loaded=%zu load_fail=%d bulk_reloc_ok=%d bulk_reloc_fail=%d",
+        summary, sizeof(summary),
+        "BATCH V6 SUMMARY: files=%zu loaded=%zu load_fail=%d scanned_modules=%zu unique_undefined=%zu missing=%zu resolved=%zu",
         count,
         loaded_count,
         load_fail_count,
-        bulk_reloc_ok,
-        bulk_reloc_fail
+        unique_modules_scanned,
+        total_undefined,
+        unique_missing_total,
+        unique_resolved_total
     );
 
     append_log(summary);
-    result += "\n";
     result += summary;
+    delete[] global_stats;
+
+    // No dlclose here: keep the diagnostic deterministic until process exit.
+    append_log("CLOSE: skipped (diagnostic mode; process exit will reclaim modules)");
 }
 
 } // namespace
