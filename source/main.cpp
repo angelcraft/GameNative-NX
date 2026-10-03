@@ -2370,11 +2370,11 @@ void runtime_probe_leaf_module(std::string& result) {
     // Safe first runtime step: preload every bundled module lazily without
     // dependency autoload, then force relocation/initialization of ONE small,
     // non-JNI leaf library. We do not call any exported function.
-    const char* target = "libsndfile.so";
-    const char* symbol = "sf_open";
+    const char* target = "libzstd-jni-1.5.7-5.so";
+    const char* symbol = "ZSTD_versionNumber";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V1: single-module relocation/initialization");
+    append_log("RUNTIME PROBE V2: single-module relocation/initialization");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD.");
