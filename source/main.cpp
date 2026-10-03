@@ -2371,14 +2371,14 @@ void batch_audit_all_sos(std::string& result) {
 
 
 void runtime_probe_leaf_module(std::string& result) {
-    // V12 diagnostic step: preload every bundled module lazily without
-    // dependency autoload, hook the target constructor, then call dlsym()
-    // directly on the already-mapped target. We do not call any export.
+    // V13 diagnostic step: preload every bundled module lazily without
+    // dependency autoload, install only the ArrayList_add bridge, hook the
+    // target constructor, then call dlsym() directly on the target.
     const char* target = "libvortekrenderer.so";
     const char* symbol = "Java_com_winlator_xenvironment_components_VortekRendererComponent_initVulkanWrapper";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V12: direct dlsym after constructor isolation");
+    append_log("RUNTIME PROBE V13: direct dlsym + ArrayList_add bridge");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD. The target is reopened with LAZY (autoload enabled) so its declared bundled dependency can enter scope.");
@@ -2419,6 +2419,73 @@ void runtime_probe_leaf_module(std::string& result) {
 
     append_log((std::string("PROBE PRELOAD SUMMARY loaded=") + std::to_string(loaded)).c_str());
 
+    // V13 diagnostic isolation:
+    // V12 proved that direct dlsym() no longer hangs, but relocation stops
+    // on the first unresolved import: ArrayList_add. Promote the REAL bundled
+    // implementation from libwinlator_11.so into the main export namespace,
+    // while deliberately keeping NO_AUTOLOAD and skipping the second autoload
+    // dlopen path. This isolates symbol-namespace behavior from dependency
+    // autoload/constructor behavior.
+    append_log("RUNTIME PROBE V13: installing direct ArrayList_add bridge");
+
+    void* winlator11_handle = solder_dlopen(
+        "libwinlator_11.so",
+        SOLDER_LAZY | SOLDER_NO_AUTOLOAD
+    );
+
+    if (!winlator11_handle) {
+        const char* err = solder_dlerror();
+        result = std::string("RUNTIME PROBE: ArrayList bridge dlopen FAILED: ") +
+                 (err ? err : "(no error text)");
+        append_log(result.c_str());
+        return;
+    }
+
+    void* arraylist_add = solder_dlsym(
+        winlator11_handle,
+        "ArrayList_add"
+    );
+    const char* arraylist_err = solder_dlerror();
+
+    if (!arraylist_add) {
+        result = std::string("RUNTIME PROBE: ArrayList_add bridge lookup FAILED: ") +
+                 (arraylist_err ? arraylist_err : "(no error text)");
+        append_log(result.c_str());
+        return;
+    }
+
+    char bridge_line[256];
+    std::snprintf(
+        bridge_line, sizeof(bridge_line),
+        "RUNTIME PROBE: ArrayList_add implementation=%p",
+        arraylist_add
+    );
+    append_log(bridge_line);
+
+    if (main_export_exists("ArrayList_add")) {
+        append_log("RUNTIME PROBE: ArrayList_add already present in main exports");
+    } else if (g_main_export_count >= kMaxMainExports) {
+        result = "RUNTIME PROBE: main export table full; cannot promote ArrayList_add";
+        append_log(result.c_str());
+        return;
+    } else {
+        solder_export_t promoted = g_main_exports[0];
+        promoted.name = "ArrayList_add";
+        promoted.addr_rx = reinterpret_cast<decltype(promoted.addr_rx)>(arraylist_add);
+        g_main_exports[g_main_export_count++] = promoted;
+
+        if (solder_set_main_exports(
+                g_main_exports,
+                g_main_export_count
+            ) != 0) {
+            result = "RUNTIME PROBE: failed to re-install main exports with ArrayList_add";
+            append_log(result.c_str());
+            return;
+        }
+
+        append_log("RUNTIME PROBE: promoted bundled ArrayList_add from libwinlator_11.so into main exports");
+    }
+
     void* target_handle = nullptr;
     for (size_t i = 0; i < names.size(); ++i) {
         if (names[i] == target) {
@@ -2458,7 +2525,7 @@ void runtime_probe_leaf_module(std::string& result) {
     // The target is already mapped and hooked. We now call solder_dlsym()
     // directly so we can determine whether the hang occurs inside relocation/
     // symbol resolution itself, independent of a second dlopen() path.
-    append_log("RUNTIME PROBE V12: skipping second autoload dlopen");
+    append_log("RUNTIME PROBE V13: skipping second autoload dlopen; using direct symbol bridge");
     append_log((std::string("RUNTIME PROBE: before direct dlsym(") + symbol + ")").c_str());
     void* resolved = solder_dlsym(target_handle, symbol);
     const char* err = solder_dlerror();
