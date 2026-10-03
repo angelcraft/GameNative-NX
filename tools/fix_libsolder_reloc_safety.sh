@@ -46,10 +46,3 @@ if old2 not in s:
 s = s.replace(old2, new2, 1)
 p.write_text(s)
 PY
-chmod +x /mnt/data/fix_libsolder_reloc_safety.sh
-python3 - <<'PY'
-from pathlib import Path
-s=Path('/mnt/data/main_dependency_preload_v6.cpp').read_text()
-print('main count',s.count('int main('),'dlclose calls',s.count('solder_dlclose('),'skip close', 'CLOSE: skipped' in s)
-print('script size',Path('/mnt/data/fix_libsolder_reloc_safety.sh').stat().st_size)
-PY
