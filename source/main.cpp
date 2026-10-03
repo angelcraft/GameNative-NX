@@ -2371,14 +2371,14 @@ void batch_audit_all_sos(std::string& result) {
 
 
 void runtime_probe_leaf_module(std::string& result) {
-    // Safe first runtime step: preload every bundled module lazily without
-    // dependency autoload, then force relocation/initialization of ONE small,
-    // non-JNI leaf library. We do not call any exported function.
+    // V12 diagnostic step: preload every bundled module lazily without
+    // dependency autoload, hook the target constructor, then call dlsym()
+    // directly on the already-mapped target. We do not call any export.
     const char* target = "libvortekrenderer.so";
     const char* symbol = "Java_com_winlator_xenvironment_components_VortekRendererComponent_initVulkanWrapper";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V11: dependency autoload + constructor isolation");
+    append_log("RUNTIME PROBE V12: direct dlsym after constructor isolation");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD. The target is reopened with LAZY (autoload enabled) so its declared bundled dependency can enter scope.");
@@ -2453,28 +2453,13 @@ void runtime_probe_leaf_module(std::string& result) {
 
     append_log("RUNTIME PROBE: hooked Vortek init_array constructor at offset 0x6617c");
 
-    // Re-open with autoload enabled; the hook remains on the already mapped
-    // target while its declared dependencies can enter the scope.
-    void* autoload_handle = solder_dlopen(target, SOLDER_LAZY);
-    if (!autoload_handle) {
-        const char* err = solder_dlerror();
-        result = std::string("RUNTIME PROBE: target autoload dlopen FAILED: ") +
-                 (err ? err : "(no error text)");
-        append_log(result.c_str());
-        return;
-    }
-
-    target_handle = autoload_handle;
-
-    if (!target_handle) {
-        const char* err = solder_dlerror();
-        result = std::string("RUNTIME PROBE: target dlopen FAILED: ") +
-                 (err ? err : "(no error text)");
-        append_log(result.c_str());
-        return;
-    }
-
-    append_log((std::string("RUNTIME PROBE: before dlsym(") + symbol + ")").c_str());
+    // V12 diagnostic isolation:
+    // Do NOT reopen the target with autoload enabled here.
+    // The target is already mapped and hooked. We now call solder_dlsym()
+    // directly so we can determine whether the hang occurs inside relocation/
+    // symbol resolution itself, independent of a second dlopen() path.
+    append_log("RUNTIME PROBE V12: skipping second autoload dlopen");
+    append_log((std::string("RUNTIME PROBE: before direct dlsym(") + symbol + ")").c_str());
     void* resolved = solder_dlsym(target_handle, symbol);
     const char* err = solder_dlerror();
 
