@@ -14,6 +14,9 @@
 
 namespace {
 
+// Temporary hook target used to isolate an Android-specific constructor.
+void gn_ctor_noop() {}
+
 constexpr const char* kRoot =
     "sdmc:/switch/gamenative_nx";
 
@@ -2374,7 +2377,7 @@ void runtime_probe_leaf_module(std::string& result) {
     const char* symbol = "Java_com_winlator_renderer_VulkanRenderer_nativeInit";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V6: single-module relocation/initialization");
+    append_log("RUNTIME PROBE V7: constructor isolation hook");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD.");
@@ -2431,6 +2434,32 @@ void runtime_probe_leaf_module(std::string& result) {
                  (err ? err : "(no error text)");
         append_log(result.c_str());
         return;
+    }
+
+    // libvulkan_renderer.so has a DT_INIT_ARRAY entry at 0x48d68 that
+    // contains Android linker-private logic. Hook it before finalization
+    // so we can isolate that constructor from the other init functions.
+    const int hook_rc = solder_hook_offset(
+        target_handle,
+        0x48d68ULL,
+        reinterpret_cast<void*>(&gn_ctor_noop)
+    );
+
+    if (hook_rc != 0) {
+        const char* hook_err = solder_dlerror();
+        char hook_line[512];
+        std::snprintf(
+            hook_line,
+            sizeof(hook_line),
+            "RUNTIME PROBE: constructor hook FAILED rc=%d err=%s",
+            hook_rc,
+            hook_err ? hook_err : "(no error text)"
+        );
+        append_log(hook_line);
+    } else {
+        append_log(
+            "RUNTIME PROBE: hooked init_array constructor at offset 0x48d68"
+        );
     }
 
     append_log((std::string("RUNTIME PROBE: before dlsym(") + symbol + ")").c_str());
