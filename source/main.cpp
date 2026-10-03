@@ -2720,6 +2720,33 @@ void runtime_probe_leaf_module(std::string& result) {
         return;
     }
 
+    // V20/V21: pthread_create must also be captured BEFORE target relocation.
+    // Otherwise solder_dlsym() binds Vortek's PLT directly to libc and the
+    // guard installed later has no effect.
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (g_main_exports[i].name &&
+            std::strcmp(g_main_exports[i].name, "pthread_create") == 0) {
+            g_vortek_probe_original_pthread_create =
+                reinterpret_cast<PthreadCreateProbeFn>(g_main_exports[i].addr_rx);
+            break;
+        }
+    }
+
+    if (!g_vortek_probe_original_pthread_create) {
+        append_log("RUNTIME PROBE V21: pthread_create original export not found; refusing unsafe execution");
+        return;
+    }
+
+    g_vortek_probe_pthread_create_count = 0;
+    append_log("RUNTIME PROBE V21: installing pthread_create guard BEFORE target relocation (9th call is requestHandlerThread)");
+    if (!replace_main_export_addr(
+            "pthread_create",
+            reinterpret_cast<void*>(gn_vortek_probe_pthread_create)) ||
+        solder_set_main_exports(g_main_exports, g_main_export_count) != 0) {
+        append_log("RUNTIME PROBE V21: failed to install pthread_create guard");
+        return;
+    }
+
     // V12 diagnostic isolation:
     // Do NOT reopen the target with autoload enabled here.
     // The target is already mapped and hooked. We now call solder_dlsym()
@@ -2853,31 +2880,7 @@ void runtime_probe_leaf_module(std::string& result) {
     const auto create_for_client =
         reinterpret_cast<CreateVkContextForClientFn>(internal_target);
 
-    for (int i = 0; i < g_main_export_count; ++i) {
-        if (g_main_exports[i].name &&
-            std::strcmp(g_main_exports[i].name, "pthread_create") == 0) {
-            g_vortek_probe_original_pthread_create =
-                reinterpret_cast<PthreadCreateProbeFn>(g_main_exports[i].addr_rx);
-            break;
-        }
-    }
-
-    if (!g_vortek_probe_original_pthread_create) {
-        append_log("RUNTIME PROBE V20: pthread_create original export not found; refusing unsafe execution");
-        return;
-    }
-
-    g_vortek_probe_pthread_create_count = 0;
-    append_log("RUNTIME PROBE V20: installing pthread_create guard (9th call is requestHandlerThread)");
-    if (!replace_main_export_addr(
-            "pthread_create",
-            reinterpret_cast<void*>(gn_vortek_probe_pthread_create)) ||
-        solder_set_main_exports(g_main_exports, g_main_export_count) != 0) {
-        append_log("RUNTIME PROBE V20: failed to install pthread_create guard");
-        return;
-    }
-
-    append_log("RUNTIME PROBE V20: calling recovered internal createVkContextForClient with request thread blocked");
+    append_log("RUNTIME PROBE V21: calling recovered internal createVkContextForClient with request thread blocked");
 
     void* context = create_for_client(
         bootstrap_fd,
@@ -2891,23 +2894,23 @@ void runtime_probe_leaf_module(std::string& result) {
         "pthread_create",
         reinterpret_cast<void*>(g_vortek_probe_original_pthread_create));
     solder_set_main_exports(g_main_exports, g_main_export_count);
-    append_log("RUNTIME PROBE V20: restored ordinary main pthread_create export");
+    append_log("RUNTIME PROBE V21: restored ordinary main pthread_create export");
 
     if (!context) {
         const int saved_errno = errno;
         char context_failed[256];
         std::snprintf(context_failed, sizeof(context_failed),
-                      "RUNTIME PROBE V20: createVkContextForClient safely returned NULL errno=%d",
+                      "RUNTIME PROBE V21: createVkContextForClient safely returned NULL errno=%d",
                       saved_errno);
         append_log(context_failed);
-        append_log("RUNTIME PROBE V20: requestHandlerThread was intentionally prevented; probe clientFd was synthetic (-1)");
+        append_log("RUNTIME PROBE V21: requestHandlerThread was intentionally prevented; probe clientFd was synthetic (-1)");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
     char context_ok[256];
     std::snprintf(context_ok, sizeof(context_ok),
-                  "RUNTIME PROBE V20: UNEXPECTED SUCCESS VkContext=%p",
+                  "RUNTIME PROBE V21: UNEXPECTED SUCCESS VkContext=%p",
                   context);
     append_log(context_ok);
     append_log("RUNTIME PROBE V20: requestHandlerThread guard did not trigger as expected");
