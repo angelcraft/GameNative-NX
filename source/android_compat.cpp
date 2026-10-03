@@ -1405,7 +1405,7 @@ extern "C" char* gn_android_ctime_r(const time_t* t, char* buf) {
         return nullptr;
     }
 
-    const char* text = std::ctime(t);
+    const char* text = ::ctime(t);
     if (!text)
         return nullptr;
 
