@@ -13,7 +13,6 @@
 #include <vector>
 #include <algorithm>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 namespace {
@@ -2648,7 +2647,14 @@ void runtime_probe_leaf_module(std::string& result) {
         return;
     }
 
-    struct sockaddr_un server_addr{};
+    // devkitA64/libnx does not ship <sys/un.h>. Define only the minimal
+    // sockaddr_un-compatible layout needed for AF_UNIX pathname sockets.
+    struct GnSockaddrUn {
+        sa_family_t sun_family;
+        char sun_path[108];
+    };
+
+    GnSockaddrUn server_addr{};
     server_addr.sun_family = AF_UNIX;
     if (std::strlen(kVortekSockPath) >= sizeof(server_addr.sun_path)) {
         append_log("RUNTIME PROBE V18: socket path too long");
