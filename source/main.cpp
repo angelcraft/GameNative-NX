@@ -2547,62 +2547,98 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log(line);
     result = line;
 
-    append_log("RUNTIME PROBE V16: resolving internal createVkContextForClient bypassing JNI");
+    append_log("RUNTIME PROBE V17: resolving internal createVkContextForClient bypassing JNI");
 
-    void* create_internal = solder_dlsym(target_handle, "createVkContextForClient");
-    const char* create_internal_err = solder_dlerror();
+    // The internal helper is not exported in this build. Instead, inspect
+    // the AArch64 instructions at the exported JNI wrapper and recover the
+    // direct BL call target. The normal Vortek JNI wrapper is a tiny thunk
+    // around createVkContext(env,obj,fd,options), so this gives us the
+    // internal function without depending on its symbol visibility.
+    void* create_jni = solder_dlsym(
+        target_handle,
+        "Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext"
+    );
+    const char* create_jni_err = solder_dlerror();
 
-    if (!create_internal) {
-        append_logf("RUNTIME PROBE V16: createVkContextForClient lookup FAILED: %s",
-                    create_internal_err ? create_internal_err : "(no error text)");
-        append_log("RUNTIME PROBE V16: cannot bypass JNI on this build");
+    if (!create_jni) {
+        append_logf("RUNTIME PROBE V17: JNI createVkContext lookup FAILED: %s",
+                    create_jni_err ? create_jni_err : "(no error text)");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
-    char create_internal_addr[256];
-    std::snprintf(create_internal_addr, sizeof(create_internal_addr),
-                  "RUNTIME PROBE V16: createVkContextForClient addr=%p",
-                  create_internal);
-    append_log(create_internal_addr);
+    char create_jni_addr[256];
+    std::snprintf(create_jni_addr, sizeof(create_jni_addr),
+                  "RUNTIME PROBE V17: JNI createVkContext addr=%p",
+                  create_jni);
+    append_log(create_jni_addr);
 
-    append_log("RUNTIME PROBE V16: resolving internal destroyVkContext for safe cleanup");
+    const uintptr_t fn_pc = reinterpret_cast<uintptr_t>(create_jni);
+    uintptr_t internal_target = 0;
+    int internal_bl_index = -1;
 
-    void* destroy_internal = solder_dlsym(target_handle, "destroyVkContext");
-    const char* destroy_internal_err = solder_dlerror();
+    // Scan the first 32 AArch64 instructions.  BL has fixed encoding
+    // 1001xxxxxxxxxxxxxxxxxxxxxxxxxx.  Decode its signed imm26 and compute
+    // the absolute PC-relative target.
+    for (int i = 0; i < 32; ++i) {
+        const uintptr_t pc = fn_pc + static_cast<uintptr_t>(i * 4);
+        const uint32_t insn = *reinterpret_cast<const uint32_t*>(pc);
 
-    if (!destroy_internal) {
-        append_logf("RUNTIME PROBE V16: destroyVkContext lookup FAILED: %s",
-                    destroy_internal_err ? destroy_internal_err : "(no error text)");
-        append_log("RUNTIME PROBE V16: refusing to create a context without a verified cleanup path");
+        char insn_line[256];
+        std::snprintf(insn_line, sizeof(insn_line),
+                      "RUNTIME PROBE V17: insn[%02d] pc=%p word=0x%08x",
+                      i, reinterpret_cast<void*>(pc), insn);
+        append_log(insn_line);
+
+        if ((insn & 0xFC000000u) != 0x94000000u)
+            continue;
+
+        int64_t imm26 = static_cast<int64_t>(insn & 0x03FFFFFFu);
+        if (imm26 & (1LL << 25))
+            imm26 |= ~((1LL << 26) - 1);
+
+        const intptr_t offset = static_cast<intptr_t>(imm26 << 2);
+        internal_target = static_cast<uintptr_t>(
+            static_cast<intptr_t>(pc) + offset
+        );
+        internal_bl_index = i;
+
+        char target_line[256];
+        std::snprintf(target_line, sizeof(target_line),
+                      "RUNTIME PROBE V17: recovered internal BL target=%p from instruction[%d]",
+                      reinterpret_cast<void*>(internal_target),
+                      i);
+        append_log(target_line);
+        break;
+    }
+
+    if (!internal_target) {
+        append_log("RUNTIME PROBE V17: no direct BL target found in JNI wrapper prologue");
+        append_log("RUNTIME PROBE V17: refusing direct execution; wrapper shape differs from expected thunk");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
-    char destroy_internal_addr[256];
-    std::snprintf(destroy_internal_addr, sizeof(destroy_internal_addr),
-                  "RUNTIME PROBE V16: destroyVkContext addr=%p",
-                  destroy_internal);
-    append_log(destroy_internal_addr);
+    (void)internal_bl_index;
 
     int socket_fds[2] = {-1, -1};
-    append_log("RUNTIME PROBE V16: creating AF_UNIX/SOCK_STREAM client socket pair");
+    append_log("RUNTIME PROBE V17: creating AF_UNIX/SOCK_STREAM client socket pair");
 
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, socket_fds) != 0) {
         const int saved_errno = errno;
         char socket_error[256];
         std::snprintf(socket_error, sizeof(socket_error),
-                      "RUNTIME PROBE V16: socketpair FAILED errno=%d",
+                      "RUNTIME PROBE V17: socketpair FAILED errno=%d",
                       saved_errno);
         append_log(socket_error);
-        append_log("RUNTIME PROBE V16: client transport unavailable; context creation skipped");
+        append_log("RUNTIME PROBE V17: client transport unavailable; context creation skipped");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
     char socket_ok[256];
     std::snprintf(socket_ok, sizeof(socket_ok),
-                  "RUNTIME PROBE V16: socketpair OK clientFd=%d peerFd=%d",
+                  "RUNTIME PROBE V17: socketpair OK clientFd=%d peerFd=%d",
                   socket_fds[0], socket_fds[1]);
     append_log(socket_ok);
 
@@ -2628,16 +2664,10 @@ void runtime_probe_leaf_module(std::string& result) {
     using CreateVkContextForClientFn =
         void* (*)(int, const VortekContextOptionsProbe*, const void*);
 
-    using DestroyVkContextFn =
-        void (*)(void*, void*);
-
     const auto create_for_client =
-        reinterpret_cast<CreateVkContextForClientFn>(create_internal);
+        reinterpret_cast<CreateVkContextForClientFn>(internal_target);
 
-    const auto destroy_context =
-        reinterpret_cast<DestroyVkContextFn>(destroy_internal);
-
-    append_log("RUNTIME PROBE V16: calling createVkContextForClient(clientFd, default Options, NULL JMethods)");
+    append_log("RUNTIME PROBE V17: calling recovered internal createVkContextForClient(clientFd, default Options, NULL JMethods)");
 
     void* context = create_for_client(
         socket_fds[0],
@@ -2649,35 +2679,50 @@ void runtime_probe_leaf_module(std::string& result) {
         const int saved_errno = errno;
         char context_failed[256];
         std::snprintf(context_failed, sizeof(context_failed),
-                      "RUNTIME PROBE V16: createVkContextForClient FAILED errno=%d",
+                      "RUNTIME PROBE V17: createVkContextForClient FAILED errno=%d",
                       saved_errno);
         append_log(context_failed);
         ::close(socket_fds[0]);
         ::close(socket_fds[1]);
-        append_log("RUNTIME PROBE V16: transport fds closed after failed context creation");
+        append_log("RUNTIME PROBE V17: transport fds closed after failed context creation");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
     char context_ok[256];
     std::snprintf(context_ok, sizeof(context_ok),
-                  "RUNTIME PROBE V16: SUCCESS VkContext=%p",
+                  "RUNTIME PROBE V17: SUCCESS VkContext=%p",
                   context);
     append_log(context_ok);
-    append_log("RUNTIME PROBE V16: context creation reached native ring-buffer/thread bootstrap");
+    append_log("RUNTIME PROBE V17: context creation reached native ring-buffer/thread bootstrap");
 
     // The peer is kept alive while the context exists because setupRingBuffers()
     // sends the two shared-memory FDs through clientFd. We do not send any Vortek
     // protocol packets; this pass only proves the native context bootstrap.
     svcSleepThread(50'000'000ULL);
 
-    append_log("RUNTIME PROBE V16: destroying context through direct native helper");
-    destroy_context(nullptr, context);
-    append_log("RUNTIME PROBE V16: context destroyed cleanly");
+    append_log("RUNTIME PROBE V17: resolving exported JNI destroyVkContext for cleanup");
+    void* destroy_jni = solder_dlsym(
+        target_handle,
+        "Java_com_winlator_xenvironment_components_VortekRendererComponent_destroyVkContext"
+    );
+    const char* destroy_jni_err = solder_dlerror();
+
+    if (!destroy_jni) {
+        append_logf("RUNTIME PROBE V17: JNI destroyVkContext lookup FAILED: %s",
+                    destroy_jni_err ? destroy_jni_err : "(no error text)");
+        append_log("RUNTIME PROBE V17: leaving context alive until process exit");
+    } else {
+        using DestroyJniFn = void (*)(void*, void*, long long);
+        const auto destroy_fn = reinterpret_cast<DestroyJniFn>(destroy_jni);
+        append_log("RUNTIME PROBE V17: destroying context through JNI wrapper with NULL env/obj");
+        destroy_fn(nullptr, nullptr, static_cast<long long>(reinterpret_cast<uintptr_t>(context)));
+        append_log("RUNTIME PROBE V17: context destroyed cleanly");
+    }
 
     ::close(socket_fds[0]);
     ::close(socket_fds[1]);
-    append_log("RUNTIME PROBE V16: transport fds closed");
+    append_log("RUNTIME PROBE V17: transport fds closed");
 
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
 }
