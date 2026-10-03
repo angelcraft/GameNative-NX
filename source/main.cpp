@@ -9,8 +9,8 @@
 #include <string>
 #include <elf.h>
 #include <cstdint>
-
-extern "C" void* solder_lookup_global(const char* symname);
+#include <vector>
+#include <algorithm>
 
 namespace {
 
@@ -1892,14 +1892,107 @@ void probe_xconnector(std::string& result) {
 
 
 
+
+struct ElfTables {
+    std::string dynstr;
+    std::vector<Elf64_Sym> dynsym;
+};
+
+bool read_elf_dynsym(const std::string& path, ElfTables& out) {
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp)
+        return false;
+
+    Elf64_Ehdr ehdr{};
+    if (std::fread(&ehdr, sizeof(ehdr), 1, fp) != 1 ||
+        std::memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_shnum == 0 ||
+        ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
+        std::fclose(fp);
+        return false;
+    }
+
+    std::vector<Elf64_Shdr> shdrs(ehdr.e_shnum);
+    std::fseek(fp, static_cast<long>(ehdr.e_shoff), SEEK_SET);
+    if (std::fread(shdrs.data(), sizeof(Elf64_Shdr), ehdr.e_shnum, fp) != ehdr.e_shnum) {
+        std::fclose(fp);
+        return false;
+    }
+
+    const Elf64_Shdr* dynsym_sh = nullptr;
+    const Elf64_Shdr* dynstr_sh = nullptr;
+    const Elf64_Shdr* shstr_sh =
+        (ehdr.e_shstrndx < ehdr.e_shnum) ? &shdrs[ehdr.e_shstrndx] : nullptr;
+
+    std::string section_names;
+    if (shstr_sh) {
+        section_names.resize(static_cast<size_t>(shstr_sh->sh_size));
+        std::fseek(fp, static_cast<long>(shstr_sh->sh_offset), SEEK_SET);
+        if (!section_names.empty() &&
+            std::fread(&section_names[0], 1, section_names.size(), fp) != section_names.size()) {
+            std::fclose(fp);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < shdrs.size(); ++i) {
+        const char* name = "";
+        if (shdrs[i].sh_name < section_names.size())
+            name = section_names.c_str() + shdrs[i].sh_name;
+
+        if (!std::strcmp(name, ".dynsym"))
+            dynsym_sh = &shdrs[i];
+        else if (!std::strcmp(name, ".dynstr"))
+            dynstr_sh = &shdrs[i];
+    }
+
+    if (!dynsym_sh || !dynstr_sh) {
+        std::fclose(fp);
+        return false;
+    }
+
+    out.dynstr.assign(static_cast<size_t>(dynstr_sh->sh_size), '\0');
+    std::fseek(fp, static_cast<long>(dynstr_sh->sh_offset), SEEK_SET);
+    if (!out.dynstr.empty() &&
+        std::fread(&out.dynstr[0], 1, out.dynstr.size(), fp) != out.dynstr.size()) {
+        std::fclose(fp);
+        return false;
+    }
+
+    const size_t dynsym_count =
+        static_cast<size_t>(dynsym_sh->sh_size / sizeof(Elf64_Sym));
+    out.dynsym.resize(dynsym_count);
+    std::fseek(fp, static_cast<long>(dynsym_sh->sh_offset), SEEK_SET);
+    if (dynsym_count &&
+        std::fread(out.dynsym.data(), sizeof(Elf64_Sym), dynsym_count, fp) != dynsym_count) {
+        std::fclose(fp);
+        return false;
+    }
+
+    std::fclose(fp);
+    return true;
+}
+
+bool bundle_export_exists(
+    const std::vector<std::string>& bundle_exports,
+    const char* name
+) {
+    return std::binary_search(
+        bundle_exports.begin(),
+        bundle_exports.end(),
+        std::string(name)
+    );
+}
+
 void batch_audit_all_sos(std::string& result) {
     result.clear();
 
     append_log("============================================================");
     append_log("BATCH AUDIT V6: complete undefined-symbol inventory");
-    append_log("All ARM64 .so files are loaded first with lazy auto-dependency discovery.");
-    append_log("Then every DT_NEEDED-visible symbol is checked against the live global loader namespace.");
-    append_log("No relocation pass, constructors, or arbitrary exported functions are executed.");
+    append_log("All ARM64 .so files are loaded first with lazy + no-auto-load; constructors are not triggered.");
+    append_log("Then every undefined symbol is checked against the custom main export table and all bundled ELF exports.");
+    append_log("No relocation pass, dependency initialization, constructors, or arbitrary exported functions are executed.");
     append_log("============================================================");
 
     DIR* dir = opendir(kNativeDir);
@@ -1959,7 +2052,7 @@ void batch_audit_all_sos(std::string& result) {
                     std::to_string(count) + "] " + name +
                     " : starting").c_str());
 
-        void* handle = solder_dlopen(name.c_str(), SOLDER_LAZY);
+        void* handle = solder_dlopen(name.c_str(), SOLDER_LAZY | SOLDER_NO_AUTOLOAD);
         const char* load_err = solder_dlerror();
 
         if (!handle) {
@@ -1981,6 +2074,43 @@ void batch_audit_all_sos(std::string& result) {
     append_log(("PRELOAD SUMMARY: requested=" + std::to_string(count) +
                 " loaded=" + std::to_string(loaded_count) +
                 " failed=" + std::to_string(load_fail_count)).c_str());
+
+    // Build a purely static provider index from the 29 bundled ELF files.
+    // This avoids relying on libsolder's linked-module list and avoids
+    // triggering relocation/initialization just to answer "does this symbol exist?".
+    std::vector<std::string> bundle_exports;
+    bundle_exports.reserve(20000);
+
+    for (size_t mi = 0; mi < loaded_count; ++mi) {
+        ElfTables tables;
+        const std::string path = std::string(kNativeDir) + "/" + loaded[mi].name;
+        if (!read_elf_dynsym(path, tables))
+            continue;
+
+        for (size_t si = 1; si < tables.dynsym.size(); ++si) {
+            const Elf64_Sym& sym = tables.dynsym[si];
+            if (sym.st_shndx == SHN_UNDEF)
+                continue;
+            if (sym.st_name >= tables.dynstr.size())
+                continue;
+
+            const char* exp_name = tables.dynstr.c_str() + sym.st_name;
+            if (!exp_name[0])
+                continue;
+
+            if (!main_export_exists(exp_name) &&
+                !bundle_export_exists(bundle_exports, exp_name)) {
+                bundle_exports.emplace_back(exp_name);
+            }
+        }
+    }
+
+    std::sort(bundle_exports.begin(), bundle_exports.end());
+
+    append_log(("STATIC PROVIDER INDEX: bundled_defined_unique=" +
+                std::to_string(bundle_exports.size()) +
+                " main_exports=" +
+                std::to_string(g_main_export_count)).c_str());
 
     // Phase 2: parse each ELF's .dynsym/.dynstr directly. For every unique
     // undefined symbol, ask the live libsolder global namespace whether a
@@ -2131,7 +2261,7 @@ void batch_audit_all_sos(std::string& result) {
             ++module_undef;
             ++total_undefined;
 
-            const bool resolved = solder_lookup_global(symname) != nullptr;
+            const bool resolved = main_export_exists(symname) || bundle_export_exists(bundle_exports, symname);
             if (resolved) {
                 ++module_resolved;
                 ++unique_resolved_total;
