@@ -14,6 +14,10 @@
 
 namespace {
 
+// No-op constructor target used by solder_hook_offset() during diagnosis.
+// Keep C linkage-free and plain void() so it can replace a .init_array entry.
+static void gn_ctor_noop() {}
+
 constexpr const char* kRoot =
     "sdmc:/switch/gamenative_nx";
 
