@@ -2375,10 +2375,10 @@ void runtime_probe_leaf_module(std::string& result) {
     // dependency autoload, install only the ArrayList_add bridge, hook the
     // target constructor, then call dlsym() directly on the target.
     const char* target = "libvortekrenderer.so";
-    const char* symbol = "Java_com_winlator_xenvironment_components_VortekRendererComponent_initVulkanWrapper";
+    const char* symbol = "Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V14: execute native Vortek bootstrap after relocation");
+    append_log("RUNTIME PROBE V15: resolve native Vortek createVkContext after relocation");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD. The target is reopened with LAZY (autoload enabled) so its declared bundled dependency can enter scope.");
@@ -2426,7 +2426,7 @@ void runtime_probe_leaf_module(std::string& result) {
     // while deliberately keeping NO_AUTOLOAD and skipping the second autoload
     // dlopen path. This isolates symbol-namespace behavior from dependency
     // autoload/constructor behavior.
-    append_log("RUNTIME PROBE V14: installing direct ArrayList_add bridge");
+    append_log("RUNTIME PROBE V15: installing direct ArrayList_add bridge");
 
     void* winlator11_handle = solder_dlopen(
         "libwinlator_11.so",
@@ -2525,7 +2525,7 @@ void runtime_probe_leaf_module(std::string& result) {
     // The target is already mapped and hooked. We now call solder_dlsym()
     // directly so we can determine whether the hang occurs inside relocation/
     // symbol resolution itself, independent of a second dlopen() path.
-    append_log("RUNTIME PROBE V13: skipping second autoload dlopen; using direct symbol bridge");
+    append_log("RUNTIME PROBE V15: skipping second autoload dlopen; using direct symbol bridge");
     append_log((std::string("RUNTIME PROBE: before direct dlsym(") + symbol + ")").c_str());
     void* resolved = solder_dlsym(target_handle, symbol);
     const char* err = solder_dlerror();
@@ -2544,39 +2544,16 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log(line);
     result = line;
 
-    append_log("RUNTIME PROBE V14: resolving native Vortek execution entrypoint vortekInitOnce");
+    append_log("RUNTIME PROBE V15: createVkContext is the actual Vortek JNI bootstrap entrypoint");
+    append_log("RUNTIME PROBE V15: resolve-only mode; NOT calling createVkContext yet");
+    append_log("RUNTIME PROBE V15: expected JNI signature conceptually (JNIEnv*, jobject, jint, jobject) -> jlong");
 
-    // The public Vortek client source exposes vortekInitOnce() as a plain C
-    // helper with signature bool vortekInitOnce(). It performs the native
-    // client/server connection bootstrap and is a safer first execution probe
-    // than calling a JNI entrypoint without a real JVM/JNIEnv.
-    void* init_once_symbol = solder_dlsym(target_handle, "vortekInitOnce");
-    const char* init_once_err = solder_dlerror();
-
-    if (!init_once_symbol) {
-        append_logf("RUNTIME PROBE V14: vortekInitOnce lookup unavailable: %s",
-                    init_once_err ? init_once_err : "(no error text)");
-        append_log("RUNTIME PROBE V14: skipping execution call; JNI entrypoint remains resolved");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-
-    char init_addr_line[256];
-    std::snprintf(init_addr_line, sizeof(init_addr_line),
-                  "RUNTIME PROBE V14: vortekInitOnce addr=%p",
-                  init_once_symbol);
-    append_log(init_addr_line);
-
-    using VortekInitOnceFn = bool (*)();
-    const auto vortek_init_once =
-        reinterpret_cast<VortekInitOnceFn>(init_once_symbol);
-
-    append_log("RUNTIME PROBE V14: calling vortekInitOnce()");
-    const bool init_ok = vortek_init_once();
-
-    append_log(init_ok
-                   ? "RUNTIME PROBE V14: vortekInitOnce() returned TRUE"
-                   : "RUNTIME PROBE V14: vortekInitOnce() returned FALSE");
+    // The Android-side VortekRendererComponent calls createVkContext(clientFd, options).
+    // We deliberately stop after symbol resolution because this native Switch
+    // probe does not have a real JVM/JNIEnv or a valid Options Java object.
+    // Calling the function with fabricated pointers/objects would turn a
+    // useful loader diagnostic into an avoidable crash.
+    append_log("RUNTIME PROBE V15: JNI entrypoint resolved successfully; execution deferred until JNI arguments are reconstructed");
 
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
 }
