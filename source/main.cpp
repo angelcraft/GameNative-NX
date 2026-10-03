@@ -90,7 +90,7 @@ std::string hex_addr(void* ptr) {
 
     return std::string(buffer);
 }
-constexpr int kMaxMainExports = 512;
+constexpr int kMaxMainExports = 4096;
 
 static solder_export_t g_main_exports[kMaxMainExports];
 static int g_main_export_count = 0;
