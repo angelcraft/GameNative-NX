@@ -2025,8 +2025,10 @@ void batch_audit_all_sos(std::string& result) {
             continue;
         }
 
-        append_log((std::string("RELOC ") + probe.module +
-                    " : before dlsym(") + probe.symbol + ")").c_str());
+        const std::string reloc_msg =
+            std::string("RELOC ") + probe.module +
+            " : before dlsym(" + probe.symbol + ")";
+        append_log(reloc_msg.c_str());
 
         void* symbol = solder_dlsym(handle, probe.symbol);
         const char* err = solder_dlerror();
