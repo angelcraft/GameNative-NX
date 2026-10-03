@@ -2364,6 +2364,97 @@ void batch_audit_all_sos(std::string& result) {
     append_log("CLOSE: skipped (diagnostic mode; process exit will reclaim modules)");
 }
 
+
+
+void runtime_probe_leaf_module(std::string& result) {
+    // Safe first runtime step: preload every bundled module lazily without
+    // dependency autoload, then force relocation/initialization of ONE small,
+    // non-JNI leaf library. We do not call any exported function.
+    const char* target = "libsndfile.so";
+    const char* symbol = "sf_open";
+
+    append_log("============================================================");
+    append_log("RUNTIME PROBE V1: single-module relocation/initialization");
+    append_log((std::string("Target: ") + target).c_str());
+    append_log((std::string("Probe symbol: ") + symbol).c_str());
+    append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD.");
+    append_log("Only the target is forced through solder_dlsym().");
+    append_log("No exported function is called after dlsym().");
+
+    std::vector<std::string> names;
+    DIR* dir = opendir(kNativeDir);
+    if (!dir) {
+        result = "RUNTIME PROBE: cannot open native dir";
+        append_log(result.c_str());
+        return;
+    }
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(dir)) != nullptr) {
+        const char* n = ent->d_name;
+        const size_t len = std::strlen(n);
+        if (len >= 3 && std::strcmp(n + len - 3, ".so") == 0)
+            names.emplace_back(n);
+    }
+    closedir(dir);
+    std::sort(names.begin(), names.end());
+
+    void* handles[64]{};
+    size_t loaded = 0;
+    for (size_t i = 0; i < names.size() && loaded < 64; ++i) {
+        append_log((std::string("PROBE PRELOAD [") + std::to_string(i + 1) + "/" +
+                    std::to_string(names.size()) + "] " + names[i]).c_str());
+        void* h = solder_dlopen(names[i].c_str(), SOLDER_LAZY | SOLDER_NO_AUTOLOAD);
+        const char* err = solder_dlerror();
+        if (!h) {
+            append_logf((std::string("PROBE PRELOAD FAILED ") + names[i] + ": %s").c_str(),
+                        err ? err : "(no error text)");
+            continue;
+        }
+        handles[loaded++] = h;
+    }
+
+    append_log((std::string("PROBE PRELOAD SUMMARY loaded=") + std::to_string(loaded)).c_str());
+
+    void* target_handle = nullptr;
+    for (size_t i = 0; i < names.size(); ++i) {
+        // Re-open the already-loaded target; solder should return the existing
+        // module handle without re-running initialization.
+        if (names[i] == target) {
+            target_handle = solder_dlopen(target, SOLDER_LAZY | SOLDER_NO_AUTOLOAD);
+            break;
+        }
+    }
+
+    if (!target_handle) {
+        const char* err = solder_dlerror();
+        result = std::string("RUNTIME PROBE: target dlopen FAILED: ") +
+                 (err ? err : "(no error text)");
+        append_log(result.c_str());
+        return;
+    }
+
+    append_log((std::string("RUNTIME PROBE: before dlsym(") + symbol + ")").c_str());
+    void* resolved = solder_dlsym(target_handle, symbol);
+    const char* err = solder_dlerror();
+
+    if (!resolved) {
+        result = std::string("RUNTIME PROBE: dlsym FAILED: ") +
+                 (err ? err : "(no error text)");
+        append_log(result.c_str());
+        return;
+    }
+
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "RUNTIME PROBE: SUCCESS module=%s symbol=%s addr=%p",
+                  target, symbol, resolved);
+    append_log(line);
+    result = line;
+
+    append_log("RUNTIME PROBE: target relocation/initialization completed without crash");
+    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+}
+
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
@@ -2388,8 +2479,8 @@ int main(int /*argc*/, char** /*argv*/) {
         draw_header();
 
         std::printf(
-            "BATCH ARM64 AUDIT\n\n"
-            "This pass loads every ARM64 .so with:\n"
+            "RUNTIME PROBE\n\n"
+            "This pass preloads all ARM64 .so and then forces one leaf module:\n"
             "  SOLDER_LAZY | SOLDER_NO_AUTOLOAD\n\n"
             "It does NOT call dlsym on arbitrary exports and\n"
             "does NOT execute JNI functions.\n\n"
@@ -2411,7 +2502,7 @@ int main(int /*argc*/, char** /*argv*/) {
         );
 
         std::printf(
-            "A = Run batch audit\n"
+            "A = Run runtime probe\n"
             "+ = Exit\n\n"
         );
 
@@ -2437,7 +2528,7 @@ int main(int /*argc*/, char** /*argv*/) {
             solder_ok &&
             !audited) {
 
-            batch_audit_all_sos(audit_result);
+            runtime_probe_leaf_module(audit_result);
             audited = true;
         }
 
