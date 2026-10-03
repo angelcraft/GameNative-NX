@@ -1390,6 +1390,59 @@ extern "C" char* gn_android_optarg = nullptr;
 // Resolution-only compatibility object for Bionic's __sF FILE array.
 extern "C" FILE gn_android_sF[3] = {};
 
+
+
+// Additional libc imports surfaced by the latest relocation smoke test.
+// These are intentionally conservative compatibility shims for now.
+extern "C" int gn_android_fork() {
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" char* gn_android_ctime_r(const time_t* t, char* buf) {
+    if (!t || !buf) {
+        errno = EINVAL;
+        return nullptr;
+    }
+
+    const char* text = std::ctime(t);
+    if (!text)
+        return nullptr;
+
+    std::memcpy(buf, text, 26);
+    buf[26] = '\0';
+    return buf;
+}
+
+extern "C" int gn_android_optind = 1;
+
+// Resolution-only compatibility object for libc's stderr variable.
+// Keep it valid enough for relocation; runtime stdio semantics come later.
+extern "C" FILE* gn_android_stderr = nullptr;
+
+extern "C" int gn_android_ioctl(int /*fd*/, unsigned long /*request*/, ...) {
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" char* gn_android_basename(char* path) {
+    if (!path || !*path)
+        return path;
+
+    char* end = path + std::strlen(path);
+    while (end > path && end[-1] == '/')
+        --end;
+
+    if (end == path)
+        return path;
+
+    char* p = end;
+    while (p > path && p[-1] != '/')
+        --p;
+
+    return p;
+}
+
 extern "C" uintptr_t gn_android_unimplemented(...) {
     errno = ENOSYS;
     return 0;
@@ -1829,6 +1882,12 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("sincos", (void*)&gn_android_sincos),
     SOLDER_EXPORT("optarg", (void*)&gn_android_optarg),
     SOLDER_EXPORT("__sF", (void*)gn_android_sF),
+    SOLDER_EXPORT("stderr", (void*)&gn_android_stderr),
+    SOLDER_EXPORT("fork", (void*)&gn_android_fork),
+    SOLDER_EXPORT("ctime_r", (void*)&gn_android_ctime_r),
+    SOLDER_EXPORT("optind", (void*)&gn_android_optind),
+    SOLDER_EXPORT("ioctl", (void*)&gn_android_ioctl),
+    SOLDER_EXPORT("basename", (void*)&gn_android_basename),
 
     SOLDER_EXPORT(
         "fgetws",
