@@ -43,6 +43,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -f tools/fix_libsolder_reloc_safety.sh
+          echo "Applying tools/fix_libsolder_reloc_safety.sh"
           bash tools/fix_libsolder_reloc_safety.sh
 
       - name: Check required Switch headers and libraries
