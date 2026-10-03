@@ -9,8 +9,11 @@
 #include <string>
 #include <elf.h>
 #include <cstdint>
+#include <cerrno>
 #include <vector>
 #include <algorithm>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace {
 
@@ -2544,16 +2547,137 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log(line);
     result = line;
 
-    append_log("RUNTIME PROBE V15: createVkContext is the actual Vortek JNI bootstrap entrypoint");
-    append_log("RUNTIME PROBE V15: resolve-only mode; NOT calling createVkContext yet");
-    append_log("RUNTIME PROBE V15: expected JNI signature conceptually (JNIEnv*, jobject, jint, jobject) -> jlong");
+    append_log("RUNTIME PROBE V16: resolving internal createVkContextForClient bypassing JNI");
 
-    // The Android-side VortekRendererComponent calls createVkContext(clientFd, options).
-    // We deliberately stop after symbol resolution because this native Switch
-    // probe does not have a real JVM/JNIEnv or a valid Options Java object.
-    // Calling the function with fabricated pointers/objects would turn a
-    // useful loader diagnostic into an avoidable crash.
-    append_log("RUNTIME PROBE V15: JNI entrypoint resolved successfully; execution deferred until JNI arguments are reconstructed");
+    void* create_internal = solder_dlsym(target_handle, "createVkContextForClient");
+    const char* create_internal_err = solder_dlerror();
+
+    if (!create_internal) {
+        append_logf("RUNTIME PROBE V16: createVkContextForClient lookup FAILED: %s",
+                    create_internal_err ? create_internal_err : "(no error text)");
+        append_log("RUNTIME PROBE V16: cannot bypass JNI on this build");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    char create_internal_addr[256];
+    std::snprintf(create_internal_addr, sizeof(create_internal_addr),
+                  "RUNTIME PROBE V16: createVkContextForClient addr=%p",
+                  create_internal);
+    append_log(create_internal_addr);
+
+    append_log("RUNTIME PROBE V16: resolving internal destroyVkContext for safe cleanup");
+
+    void* destroy_internal = solder_dlsym(target_handle, "destroyVkContext");
+    const char* destroy_internal_err = solder_dlerror();
+
+    if (!destroy_internal) {
+        append_logf("RUNTIME PROBE V16: destroyVkContext lookup FAILED: %s",
+                    destroy_internal_err ? destroy_internal_err : "(no error text)");
+        append_log("RUNTIME PROBE V16: refusing to create a context without a verified cleanup path");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    char destroy_internal_addr[256];
+    std::snprintf(destroy_internal_addr, sizeof(destroy_internal_addr),
+                  "RUNTIME PROBE V16: destroyVkContext addr=%p",
+                  destroy_internal);
+    append_log(destroy_internal_addr);
+
+    int socket_fds[2] = {-1, -1};
+    append_log("RUNTIME PROBE V16: creating AF_UNIX/SOCK_STREAM client socket pair");
+
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, socket_fds) != 0) {
+        const int saved_errno = errno;
+        char socket_error[256];
+        std::snprintf(socket_error, sizeof(socket_error),
+                      "RUNTIME PROBE V16: socketpair FAILED errno=%d",
+                      saved_errno);
+        append_log(socket_error);
+        append_log("RUNTIME PROBE V16: client transport unavailable; context creation skipped");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    char socket_ok[256];
+    std::snprintf(socket_ok, sizeof(socket_ok),
+                  "RUNTIME PROBE V16: socketpair OK clientFd=%d peerFd=%d",
+                  socket_fds[0], socket_fds[1]);
+    append_log(socket_ok);
+
+    // ABI-compatible copy of VkContextOptions from Vortek's native source.
+    // The direct helper accepts a NULL JMethods pointer, so this execution
+    // path does not need a live JVM.
+    struct VortekContextOptionsProbe {
+        int vkMaxVersion;
+        short maxDeviceMemory;
+        short imageCacheSize;
+        signed char resourceMemoryType;
+        const char* const* exposedDeviceExtensions;
+        int exposedDeviceExtensionCount;
+    } options{};
+
+    options.vkMaxVersion = 0x00403080; // VK_API_VERSION_1_3_128
+    options.maxDeviceMemory = 0;
+    options.imageCacheSize = 256;
+    options.resourceMemoryType = 0;
+    options.exposedDeviceExtensions = nullptr;
+    options.exposedDeviceExtensionCount = 0;
+
+    using CreateVkContextForClientFn =
+        void* (*)(int, const VortekContextOptionsProbe*, const void*);
+
+    using DestroyVkContextFn =
+        void (*)(void*, void*);
+
+    const auto create_for_client =
+        reinterpret_cast<CreateVkContextForClientFn>(create_internal);
+
+    const auto destroy_context =
+        reinterpret_cast<DestroyVkContextFn>(destroy_internal);
+
+    append_log("RUNTIME PROBE V16: calling createVkContextForClient(clientFd, default Options, NULL JMethods)");
+
+    void* context = create_for_client(
+        socket_fds[0],
+        &options,
+        nullptr
+    );
+
+    if (!context) {
+        const int saved_errno = errno;
+        char context_failed[256];
+        std::snprintf(context_failed, sizeof(context_failed),
+                      "RUNTIME PROBE V16: createVkContextForClient FAILED errno=%d",
+                      saved_errno);
+        append_log(context_failed);
+        ::close(socket_fds[0]);
+        ::close(socket_fds[1]);
+        append_log("RUNTIME PROBE V16: transport fds closed after failed context creation");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    char context_ok[256];
+    std::snprintf(context_ok, sizeof(context_ok),
+                  "RUNTIME PROBE V16: SUCCESS VkContext=%p",
+                  context);
+    append_log(context_ok);
+    append_log("RUNTIME PROBE V16: context creation reached native ring-buffer/thread bootstrap");
+
+    // The peer is kept alive while the context exists because setupRingBuffers()
+    // sends the two shared-memory FDs through clientFd. We do not send any Vortek
+    // protocol packets; this pass only proves the native context bootstrap.
+    svcSleepThread(50'000'000ULL);
+
+    append_log("RUNTIME PROBE V16: destroying context through direct native helper");
+    destroy_context(nullptr, context);
+    append_log("RUNTIME PROBE V16: context destroyed cleanly");
+
+    ::close(socket_fds[0]);
+    ::close(socket_fds[1]);
+    append_log("RUNTIME PROBE V16: transport fds closed");
 
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
 }
