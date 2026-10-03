@@ -1443,6 +1443,73 @@ extern "C" char* gn_android_basename(char* path) {
     return p;
 }
 
+
+// More libc imports surfaced by the relocation smoke test.
+// These start as conservative compatibility shims so relocation can proceed.
+extern "C" char** gn_android_environ = nullptr;
+extern "C" FILE* gn_android_stdout = nullptr;
+
+extern "C" pid_t gn_android_waitpid(pid_t /*pid*/, int* /*status*/, int /*options*/) {
+    errno = ENOSYS;
+    return -1;
+}
+
+extern "C" int gn_android_ppoll(
+    struct pollfd* fds,
+    nfds_t nfds,
+    const struct timespec* timeout,
+    const sigset_t* /*sigmask*/
+) {
+    int timeout_ms = -1;
+    if (timeout) {
+        if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
+            errno = EINVAL;
+            return -1;
+        }
+        long long ms = static_cast<long long>(timeout->tv_sec) * 1000LL;
+        ms += (timeout->tv_nsec + 999999L) / 1000000L;
+        if (ms > 2147483647LL)
+            timeout_ms = 2147483647;
+        else
+            timeout_ms = static_cast<int>(ms);
+    }
+    return ::poll(fds, nfds, timeout_ms);
+}
+
+extern "C" float gn_android_wcstof(const wchar_t* nptr, wchar_t** endptr) {
+    if (!nptr) {
+        errno = EINVAL;
+        return 0.0f;
+    }
+    return static_cast<float>(std::wcstod(nptr, endptr));
+}
+
+extern "C" char* gn_android_dirname(char* path) {
+    if (!path || !*path)
+        return path;
+
+    char* end = path + std::strlen(path);
+    while (end > path && end[-1] == '/')
+        --end;
+
+    if (end == path)
+        return path;
+
+    char* p = end;
+    while (p > path && p[-1] != '/')
+        --p;
+
+    if (p == path)
+        return path;
+
+    char* slash_end = p - 1;
+    while (slash_end > path && slash_end[-1] == '/')
+        --slash_end;
+
+    *slash_end = '\0';
+    return path;
+}
+
 extern "C" uintptr_t gn_android_unimplemented(...) {
     errno = ENOSYS;
     return 0;
@@ -1888,6 +1955,12 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("optind", (void*)&gn_android_optind),
     SOLDER_EXPORT("ioctl", (void*)&gn_android_ioctl),
     SOLDER_EXPORT("basename", (void*)&gn_android_basename),
+    SOLDER_EXPORT("environ", (void*)&gn_android_environ),
+    SOLDER_EXPORT("waitpid", (void*)&gn_android_waitpid),
+    SOLDER_EXPORT("ppoll", (void*)&gn_android_ppoll),
+    SOLDER_EXPORT("stdout", (void*)&gn_android_stdout),
+    SOLDER_EXPORT("wcstof", (void*)&gn_android_wcstof),
+    SOLDER_EXPORT("dirname", (void*)&gn_android_dirname),
 
     SOLDER_EXPORT(
         "fgetws",
