@@ -1894,8 +1894,8 @@ void batch_audit_all_sos(std::string& result) {
     result.clear();
 
     append_log("============================================================");
-    append_log("BATCH AUDIT V3: preload bundled dependencies + relocation smoke");
-    append_log("All ARM64 .so files are loaded first with lazy/no-autoload.");
+    append_log("BATCH AUDIT V4: preload bundled dependencies + relocation smoke (safe dlsym diagnostics)");
+    append_log("All ARM64 .so files are loaded first with lazy auto-dependency discovery.");
     append_log("Then selected bundled-dependency modules are forced to relocate.");
     append_log("No arbitrary exported functions are called.");
     append_log("============================================================");
@@ -1948,9 +1948,10 @@ void batch_audit_all_sos(std::string& result) {
     result += "Found " + std::to_string(count) + " ARM64 .so files\n\n";
 
     // Phase 1: preload every bundled module and KEEP it alive.
-    // This makes symbols exported by bundled internal dependencies visible
-    // to later relocations, while Android/Unix symbols still come from the
-    // combined main export table.
+    // IMPORTANT: allow libsolder to scan DT_NEEDED dependencies.
+    // Dependencies are linked into the global module list only after
+    // relocation, so SOLDER_NO_AUTOLOAD would make their symbols invisible
+    // to solder_lookup_global().
     for (size_t i = 0; i < count; ++i) {
         const std::string& name = names[i];
 
@@ -1960,7 +1961,7 @@ void batch_audit_all_sos(std::string& result) {
 
         void* handle = solder_dlopen(
             name.c_str(),
-            SOLDER_LAZY | SOLDER_NO_AUTOLOAD
+            SOLDER_LAZY
         );
 
         const char* load_err = solder_dlerror();
@@ -1986,7 +1987,9 @@ void batch_audit_all_sos(std::string& result) {
                 " failed=" + std::to_string(load_fail_count)).c_str());
 
     // Phase 2: force relocation of modules whose DT_NEEDED includes other
-    // bundled GameNative libraries. We deliberately ask for an exported
+    // bundled GameNative libraries. Their dependencies should already have
+    // been discovered/linked by the Phase 1 auto-load pass. We deliberately
+    // ask for an exported
     // symbol but never call it. dlsym() on a lazy module forces its relocation
     // and initialization, so a successful address is a real linker smoke test.
     struct RelocProbe {
@@ -2071,12 +2074,10 @@ void batch_audit_all_sos(std::string& result) {
         }
     }
 
-    // Keep modules alive until all probes are complete, then close them in
-    // reverse order.
-    for (size_t i = loaded_count; i > 0; --i) {
-        solder_dlclose(loaded[i - 1].handle);
-        (void)solder_dlerror();
-    }
+    // DIAGNOSTIC MODE: do not dlclose here.
+    // This keeps the test isolated from refcount/unload behavior.
+    // The process exit will reclaim the mapped modules.
+    append_log("CLOSE: skipped (diagnostic mode; process exit will reclaim modules)");
 
     char summary[256];
     std::snprintf(
