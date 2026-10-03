@@ -2864,7 +2864,42 @@ void runtime_probe_leaf_module(std::string& result) {
         }
     }
 
-    append_log("RUNTIME PROBE V24: candidate scan complete; refusing target execution");
+    append_log("RUNTIME PROBE V25: scanning recovered JNI BL target directly (NO CALL)");
+    uintptr_t recovered_internal = 0;
+    if(native_create) {
+        const uintptr_t jni_pc = reinterpret_cast<uintptr_t>(reinterpret_cast<void*>(native_jni));
+        for(int i=0;i<96;++i) {
+            uint32_t insn = 0;
+            std::memcpy(&insn, reinterpret_cast<const void*>(jni_pc + i*4), sizeof(insn));
+            if((insn & 0xFC000000U) == 0x94000000U) {
+                int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
+                if(imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
+                recovered_internal = jni_pc + i*4 + (static_cast<int64_t>(imm26) << 2);
+                append_logf("RUNTIME PROBE V25: recovered JNI BL[%d] target=%p", i, reinterpret_cast<void*>(recovered_internal));
+                break;
+            }
+        }
+    }
+    if(recovered_internal) {
+        for(int i=0;i<128;++i) {
+            uint32_t insn = 0;
+            std::memcpy(&insn, reinterpret_cast<const void*>(recovered_internal + i*4), sizeof(insn));
+            append_logf("RUNTIME PROBE V25: target insn[%03d] pc=%p word=0x%08x", i, reinterpret_cast<void*>(recovered_internal + i*4), insn);
+            if((insn & 0xFC000000U) == 0x94000000U) {
+                int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
+                if(imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
+                const uintptr_t dst = recovered_internal + i*4 + (static_cast<int64_t>(imm26) << 2);
+                append_logf("RUNTIME PROBE V25: target BL[%d] -> %p", i, reinterpret_cast<void*>(dst));
+            }
+            if(insn == 0xD65F03C0U) {
+                append_logf("RUNTIME PROBE V25: target RET at instruction[%d]", i);
+                break;
+            }
+        }
+    } else {
+        append_log("RUNTIME PROBE V25: could not recover JNI BL target");
+    }
+    append_log("RUNTIME PROBE V25: recovered-target scan complete; refusing target execution");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
