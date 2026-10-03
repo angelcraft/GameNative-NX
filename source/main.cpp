@@ -2441,8 +2441,7 @@ void runtime_probe_leaf_module(std::string& result) {
     const int hook_rc = solder_hook_offset(
         target_handle,
         0x6617cULL,
-        reinterpret_cast<void*>(gn_ctor_noop),
-        nullptr
+        reinterpret_cast<void*>(gn_ctor_noop)
     );
 
     if (hook_rc != 0) {
