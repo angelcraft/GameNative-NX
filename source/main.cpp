@@ -2809,6 +2809,65 @@ void runtime_probe_leaf_module(std::string& result) {
         append_log(err_line);
     }
 
+    // V24: do not execute any recovered target. Instead inspect the unique
+    // direct BL destinations from createVkContext and dump their prologues.
+    // The expected native helper is one of these local functions, but we only
+    // identify it statically on the target build before attempting execution.
+    append_log("RUNTIME PROBE V24: scanning unique createVkContext BL targets (NO CALL)");
+
+    uintptr_t candidate_targets[16]{};
+    int candidate_count = 0;
+
+    if (native_create) {
+        const uintptr_t native_pc = reinterpret_cast<uintptr_t>(native_create);
+        for (int i = 0; i < 128 && candidate_count < 16; ++i) {
+            const uintptr_t pc2 = native_pc + static_cast<uintptr_t>(i * 4);
+            const uint32_t insn2 = *reinterpret_cast<const uint32_t*>(pc2);
+            if ((insn2 & 0xFC000000u) != 0x94000000u) continue;
+
+            int64_t imm26_2 = static_cast<int64_t>(insn2 & 0x03FFFFFFu);
+            if (imm26_2 & (1LL << 25)) imm26_2 |= ~((1LL << 26) - 1);
+            const intptr_t off2 = static_cast<intptr_t>(imm26_2 << 2);
+            const uintptr_t tgt2 = static_cast<uintptr_t>(static_cast<intptr_t>(pc2) + off2);
+
+            bool seen = false;
+            for (int j = 0; j < candidate_count; ++j) {
+                if (candidate_targets[j] == tgt2) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+
+            candidate_targets[candidate_count++] = tgt2;
+        }
+    }
+
+    for (int c = 0; c < candidate_count; ++c) {
+        const uintptr_t base = candidate_targets[c];
+
+        char header_line[256];
+        std::snprintf(header_line, sizeof(header_line),
+                      "RUNTIME PROBE V24: CANDIDATE[%d] addr=%p",
+                      c, reinterpret_cast<void*>(base));
+        append_log(header_line);
+
+        // Dump the first 40 instructions. We intentionally do not execute.
+        for (int i = 0; i < 40; ++i) {
+            const uintptr_t pc = base + static_cast<uintptr_t>(i * 4);
+            const uint32_t insn = *reinterpret_cast<const uint32_t*>(pc);
+            char line2[256];
+            std::snprintf(line2, sizeof(line2),
+                          "RUNTIME PROBE V24: CANDIDATE[%d] insn[%02d] pc=%p word=0x%08x",
+                          c, i, reinterpret_cast<void*>(pc), insn);
+            append_log(line2);
+        }
+    }
+
+    append_log("RUNTIME PROBE V24: candidate scan complete; refusing target execution");
+    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+    return;
+
     append_log("RUNTIME PROBE V19: resolving internal createVkContextForClient bypassing JNI");
 
     // The internal helper is not exported in this build. Instead, inspect
