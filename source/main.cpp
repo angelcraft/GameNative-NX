@@ -2864,58 +2864,79 @@ void runtime_probe_leaf_module(std::string& result) {
         }
     }
 
-    append_log("RUNTIME PROBE V25: scanning recovered JNI BL target directly (NO CALL)");
-    uintptr_t recovered_internal = 0;
-    if(native_create) {
-        // `resolved` is the exported JNI wrapper obtained above. Its first
-        // direct BL is the native createVkContextForClient helper in this
-        // build. Do not execute either function; only decode instructions.
+    append_log("RUNTIME PROBE V26: resolving recovered JNI BL through AArch64 PLT/GOT (NO CALL)");
+    uintptr_t recovered_plt = 0;
+    if (resolved) {
         const uintptr_t jni_pc = reinterpret_cast<uintptr_t>(resolved);
-        for(int i=0;i<96;++i) {
+        for (int i = 0; i < 96; ++i) {
             uint32_t insn = 0;
-            std::memcpy(&insn, reinterpret_cast<const void*>(jni_pc + i*4), sizeof(insn));
-            if((insn & 0xFC000000U) == 0x94000000U) {
+            std::memcpy(&insn, reinterpret_cast<const void*>(jni_pc + i * 4), sizeof(insn));
+            if ((insn & 0xFC000000U) == 0x94000000U) {
                 int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
-                if(imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
-                recovered_internal = jni_pc + i*4 + (static_cast<int64_t>(imm26) << 2);
-                char line_v25[256];
-                std::snprintf(line_v25, sizeof(line_v25),
-                              "RUNTIME PROBE V25: recovered JNI BL[%d] target=%p",
-                              i, reinterpret_cast<void*>(recovered_internal));
-                append_log(line_v25);
+                if (imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
+                recovered_plt = jni_pc + i * 4 + (static_cast<int64_t>(imm26) << 2);
+                char line2[256];
+                std::snprintf(line2, sizeof(line2),
+                              "RUNTIME PROBE V26: recovered JNI BL[%d] PLT=%p",
+                              i, reinterpret_cast<void*>(recovered_plt));
+                append_log(line2);
                 break;
             }
         }
     }
-    if(recovered_internal) {
-        for(int i=0;i<128;++i) {
-            uint32_t insn = 0;
-            std::memcpy(&insn, reinterpret_cast<const void*>(recovered_internal + i*4), sizeof(insn));
-            char line_v25[256];
-            std::snprintf(line_v25, sizeof(line_v25),
-                          "RUNTIME PROBE V25: target insn[%03d] pc=%p word=0x%08x",
-                          i, reinterpret_cast<void*>(recovered_internal + i*4), insn);
-            append_log(line_v25);
-            if((insn & 0xFC000000U) == 0x94000000U) {
-                int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
-                if(imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
-                const uintptr_t dst = recovered_internal + i*4 + (static_cast<int64_t>(imm26) << 2);
-                std::snprintf(line_v25, sizeof(line_v25),
-                              "RUNTIME PROBE V25: target BL[%d] -> %p",
-                              i, reinterpret_cast<void*>(dst));
-                append_log(line_v25);
+
+    uintptr_t resolved_target = 0;
+    if (recovered_plt) {
+        uint32_t a = 0, l = 0, ad = 0, br = 0;
+        std::memcpy(&a, reinterpret_cast<const void*>(recovered_plt + 0), sizeof(a));
+        std::memcpy(&l, reinterpret_cast<const void*>(recovered_plt + 4), sizeof(l));
+        std::memcpy(&ad, reinterpret_cast<const void*>(recovered_plt + 8), sizeof(ad));
+        std::memcpy(&br, reinterpret_cast<const void*>(recovered_plt + 12), sizeof(br));
+
+        char line2[256];
+        std::snprintf(line2, sizeof(line2),
+                      "RUNTIME PROBE V26: PLT words %08x %08x %08x %08x", a, l, ad, br);
+        append_log(line2);
+
+        const bool is_adrp = (a & 0x9F000000U) == 0x90000000U;
+        const bool is_ldr_x17 = (l & 0xFFC00000U) == 0xF9400000U && ((l >> 5) & 0x1FU) == 16 && (l & 0x1FU) == 17;
+        const bool is_add_x16_x16 = (ad & 0xFF00001FU) == 0x91000010U;
+        const bool is_br_x17 = br == 0xD61F0220U;
+
+        if (is_adrp && is_ldr_x17 && is_add_x16_x16 && is_br_x17) {
+            int64_t imm21 = static_cast<int64_t>(((a >> 5) & 0x7FFFFU) << 2 | ((a >> 29) & 0x3U));
+            if (imm21 & (1LL << 20)) imm21 -= (1LL << 21);
+            const uintptr_t page = recovered_plt & ~static_cast<uintptr_t>(0xFFFU);
+            const uintptr_t x16_page = page + (static_cast<int64_t>(imm21) << 12);
+            const uintptr_t got = x16_page + (static_cast<uintptr_t>((l >> 10) & 0xFFFU) << 3);
+            const uint64_t target64 = *reinterpret_cast<const uint64_t*>(got);
+            resolved_target = static_cast<uintptr_t>(target64);
+
+            std::snprintf(line2, sizeof(line2),
+                          "RUNTIME PROBE V26: PLT/GOT page=%p GOT=%p target=%p",
+                          reinterpret_cast<void*>(x16_page), reinterpret_cast<void*>(got), reinterpret_cast<void*>(resolved_target));
+            append_log(line2);
+
+            if (resolved_target) {
+                append_log("RUNTIME PROBE V26: dumping first 48 instructions at resolved target");
+                for (int i = 0; i < 48; ++i) {
+                    uint32_t insn = 0;
+                    std::memcpy(&insn, reinterpret_cast<const void*>(resolved_target + i * 4), sizeof(insn));
+                    std::snprintf(line2, sizeof(line2),
+                                  "RUNTIME PROBE V26: RESOLVED insn[%02d] pc=%p word=0x%08x",
+                                  i, reinterpret_cast<void*>(resolved_target + i * 4), insn);
+                    append_log(line2);
+                    if (insn == 0xD65F03C0U) break;
+                }
             }
-            if(insn == 0xD65F03C0U) {
-                std::snprintf(line_v25, sizeof(line_v25),
-                              "RUNTIME PROBE V25: target RET at instruction[%d]", i);
-                append_log(line_v25);
-                break;
-            }
+        } else {
+            append_log("RUNTIME PROBE V26: recovered target was not the expected AArch64 PLT form");
         }
     } else {
-        append_log("RUNTIME PROBE V25: could not recover JNI BL target");
+        append_log("RUNTIME PROBE V26: could not recover JNI BL target");
     }
-    append_log("RUNTIME PROBE V25: recovered-target scan complete; refusing target execution");
+
+    append_log("RUNTIME PROBE V26: PLT/GOT inspection complete; refusing target execution");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
