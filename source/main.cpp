@@ -2374,11 +2374,11 @@ void runtime_probe_leaf_module(std::string& result) {
     const char* symbol = "Java_com_winlator_xenvironment_components_VortekRendererComponent_initVulkanWrapper";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V9: single-module relocation/initialization");
+    append_log("RUNTIME PROBE V10: dependency autoload isolation");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
-    append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD.");
-    append_log("Only the target is forced through solder_dlsym().");
+    append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD. The target is reopened with LAZY (autoload enabled) so its declared bundled dependency can enter scope.");
+    append_log("Only the target is forced through solder_dlsym(); target dependency autoload is enabled.");
     append_log("No exported function is called after dlsym().");
 
     std::vector<std::string> names;
@@ -2415,67 +2415,12 @@ void runtime_probe_leaf_module(std::string& result) {
 
     append_log((std::string("PROBE PRELOAD SUMMARY loaded=") + std::to_string(loaded)).c_str());
 
-    // Vortek declares ArrayList_add as undefined, while both bundled
-    // libwinlator.so and libwinlator_11.so define it. With NO_AUTOLOAD,
-    // libsolder may not place that bundled dependency into Vortek's symbol
-    // scope automatically. Promote the real bundled implementation into
-    // the main export table before forcing Vortek relocation.
-    void* winlator11_handle = solder_dlopen(
-        "libwinlator_11.so",
-        SOLDER_LAZY | SOLDER_NO_AUTOLOAD
-    );
-
-    if (!winlator11_handle) {
-        const char* err = solder_dlerror();
-        result = std::string("RUNTIME PROBE: dependency dlopen FAILED: ") +
-                 (err ? err : "(no error text)");
-        append_log(result.c_str());
-        return;
-    }
-
-    void* arraylist_add = solder_dlsym(
-        winlator11_handle,
-        "ArrayList_add"
-    );
-    const char* arraylist_err = solder_dlerror();
-
-    if (!arraylist_add) {
-        result = std::string("RUNTIME PROBE: bundled ArrayList_add lookup FAILED: ") +
-                 (arraylist_err ? arraylist_err : "(no error text)");
-        append_log(result.c_str());
-        return;
-    }
-
-    if (main_export_exists("ArrayList_add")) {
-        append_log("RUNTIME PROBE: ArrayList_add already present in main exports");
-    } else if (g_main_export_count >= kMaxMainExports) {
-        result = "RUNTIME PROBE: main export table full; cannot promote ArrayList_add";
-        append_log(result.c_str());
-        return;
-    } else {
-        solder_export_t promoted = g_main_exports[0];
-        promoted.name = "ArrayList_add";
-        promoted.addr_rx = reinterpret_cast<decltype(promoted.addr_rx)>(arraylist_add);
-        g_main_exports[g_main_export_count++] = promoted;
-
-        if (solder_set_main_exports(
-                g_main_exports,
-                g_main_export_count
-            ) != 0) {
-            result = "RUNTIME PROBE: failed to re-install main exports with ArrayList_add";
-            append_log(result.c_str());
-            return;
-        }
-
-        append_log("RUNTIME PROBE: promoted bundled ArrayList_add from libwinlator_11.so into main exports");
-    }
-
     void* target_handle = nullptr;
     for (size_t i = 0; i < names.size(); ++i) {
         // Re-open the already-loaded target; solder should return the existing
         // module handle without re-running initialization.
         if (names[i] == target) {
-            target_handle = solder_dlopen(target, SOLDER_LAZY | SOLDER_NO_AUTOLOAD);
+            target_handle = solder_dlopen(target, SOLDER_LAZY);
             break;
         }
     }
