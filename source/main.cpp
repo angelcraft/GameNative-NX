@@ -2374,7 +2374,7 @@ void runtime_probe_leaf_module(std::string& result) {
     const char* symbol = "Java_me_zhanghai_android_libarchive_Archive_readOpen1";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V3: single-module relocation/initialization");
+    append_log("RUNTIME PROBE V4: single-module relocation/initialization");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD.");
