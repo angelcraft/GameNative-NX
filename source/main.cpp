@@ -14,9 +14,6 @@
 
 namespace {
 
-// Temporary hook target used to isolate an Android-specific constructor.
-void gn_ctor_noop() {}
-
 constexpr const char* kRoot =
     "sdmc:/switch/gamenative_nx";
 
@@ -1393,7 +1390,7 @@ void probe_winlator(std::string& result) {
 void probe_winlator_11(std::string& result) {
     result += "\n\n================ LIBWINLATOR_11 ================\n";
 
-    append_log("libwinlator_11.so probe: starting");
+    append_log("libvirglrenderer.so probe: starting");
 
     const int flags =
         SOLDER_LAZY |
@@ -1401,7 +1398,7 @@ void probe_winlator_11(std::string& result) {
 
     void* handle =
         solder_dlopen(
-            "libwinlator_11.so",
+            "libvirglrenderer.so",
             flags
         );
 
@@ -1413,7 +1410,7 @@ void probe_winlator_11(std::string& result) {
         result += "\n";
 
         append_logf(
-            "libwinlator_11.so probe failed: %s",
+            "libvirglrenderer.so probe failed: %s",
             err ? err : "(no error text)"
         );
         return;
@@ -1431,19 +1428,19 @@ void probe_winlator_11(std::string& result) {
 
     std::string needed;
     const bool needed_ok = inspect_needed(
-        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator_11.so",
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libvirglrenderer.so",
         needed
     );
 
     if (needed_ok) {
         result += needed;
-        append_log("libwinlator_11.so dependencies:");
+        append_log("libvirglrenderer.so dependencies:");
         append_log(needed.c_str());
     } else {
         result += "DEPENDENCY INSPECTION FAILED\n";
         result += needed;
         append_logf(
-            "libwinlator_11.so dependency inspection failed: %s",
+            "libvirglrenderer.so dependency inspection failed: %s",
             needed.c_str()
         );
     }
@@ -1452,7 +1449,7 @@ void probe_winlator_11(std::string& result) {
     std::string symbol_full;
 
     const bool symbols_ok = inspect_undefined_symbols(
-        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libwinlator_11.so",
+        "sdmc:/switch/gamenative_nx/native/arm64-v8a/libvirglrenderer.so",
         symbol_screen,
         symbol_full
     );
@@ -1460,17 +1457,17 @@ void probe_winlator_11(std::string& result) {
     result += "\nSTATIC SYMBOL INSPECTION:\n";
     result += symbol_screen;
 
-    append_log("libwinlator_11.so static undefined symbols:");
+    append_log("libvirglrenderer.so static undefined symbols:");
     append_log(symbol_full.c_str());
 
     append_log(
-        "libwinlator_11.so probe: "
+        "libvirglrenderer.so probe: "
         "ELF load succeeded (lazy/no-autoload)"
     );
 
     result += "\nRELOCATION TEST: createMemoryFd\n";
     append_log(
-        "libwinlator_11.so relocation test: "
+        "libvirglrenderer.so relocation test: "
         "calling solder_dlsym(createMemoryFd)"
     );
 
@@ -1488,7 +1485,7 @@ void probe_winlator_11(std::string& result) {
         result += "address: " + resolved_text + "\n";
 
         append_logf(
-            "libwinlator_11.so relocation test: "
+            "libvirglrenderer.so relocation test: "
             "SUCCESS, createMemoryFd=%s",
             resolved_text.c_str()
         );
@@ -1503,7 +1500,7 @@ void probe_winlator_11(std::string& result) {
     result += "\n";
 
     append_logf(
-        "libwinlator_11.so relocation test: FAILED: %s",
+        "libvirglrenderer.so relocation test: FAILED: %s",
         dlsym_err ? dlsym_err : "(no error text)"
     );
 
@@ -2373,11 +2370,11 @@ void runtime_probe_leaf_module(std::string& result) {
     // Safe first runtime step: preload every bundled module lazily without
     // dependency autoload, then force relocation/initialization of ONE small,
     // non-JNI leaf library. We do not call any exported function.
-    const char* target = "libvulkan_renderer.so";
-    const char* symbol = "Java_com_winlator_renderer_VulkanRenderer_nativeInit";
+    const char* target = "libvirglrenderer.so";
+    const char* symbol = "Java_com_winlator_xenvironment_components_VirGLRendererComponent_getCurrentEGLContextPtr";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V7: constructor isolation hook");
+    append_log("RUNTIME PROBE V8: single-module relocation/initialization");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD.");
@@ -2434,32 +2431,6 @@ void runtime_probe_leaf_module(std::string& result) {
                  (err ? err : "(no error text)");
         append_log(result.c_str());
         return;
-    }
-
-    // libvulkan_renderer.so has a DT_INIT_ARRAY entry at 0x48d68 that
-    // contains Android linker-private logic. Hook it before finalization
-    // so we can isolate that constructor from the other init functions.
-    const int hook_rc = solder_hook_offset(
-        target_handle,
-        0x48d68ULL,
-        reinterpret_cast<void*>(&gn_ctor_noop)
-    );
-
-    if (hook_rc != 0) {
-        const char* hook_err = solder_dlerror();
-        char hook_line[512];
-        std::snprintf(
-            hook_line,
-            sizeof(hook_line),
-            "RUNTIME PROBE: constructor hook FAILED rc=%d err=%s",
-            hook_rc,
-            hook_err ? hook_err : "(no error text)"
-        );
-        append_log(hook_line);
-    } else {
-        append_log(
-            "RUNTIME PROBE: hooked init_array constructor at offset 0x48d68"
-        );
     }
 
     append_log((std::string("RUNTIME PROBE: before dlsym(") + symbol + ")").c_str());
