@@ -2374,7 +2374,7 @@ void runtime_probe_leaf_module(std::string& result) {
     const char* symbol = "Java_com_winlator_xenvironment_components_VortekRendererComponent_initVulkanWrapper";
 
     append_log("============================================================");
-    append_log("RUNTIME PROBE V10: dependency autoload isolation");
+    append_log("RUNTIME PROBE V11: dependency autoload + constructor isolation");
     append_log((std::string("Target: ") + target).c_str());
     append_log((std::string("Probe symbol: ") + symbol).c_str());
     append_log("All bundled modules are preloaded with LAZY|NO_AUTOLOAD. The target is reopened with LAZY (autoload enabled) so its declared bundled dependency can enter scope.");
@@ -2417,13 +2417,51 @@ void runtime_probe_leaf_module(std::string& result) {
 
     void* target_handle = nullptr;
     for (size_t i = 0; i < names.size(); ++i) {
-        // Re-open the already-loaded target; solder should return the existing
-        // module handle without re-running initialization.
         if (names[i] == target) {
-            target_handle = solder_dlopen(target, SOLDER_LAZY);
+            target_handle = solder_dlopen(target, SOLDER_LAZY | SOLDER_NO_AUTOLOAD);
             break;
         }
     }
+
+    if (!target_handle) {
+        const char* err = solder_dlerror();
+        result = std::string("RUNTIME PROBE: target initial dlopen FAILED: ") +
+                 (err ? err : "(no error text)");
+        append_log(result.c_str());
+        return;
+    }
+
+    // libvortekrenderer.so has one constructor in .init_array at 0x6617c.
+    // Vortek uses Android linker/loader internals there. Keep that constructor
+    // from executing so we can test dependency resolution independently.
+    const int hook_rc = solder_hook_offset(
+        target_handle,
+        0x6617cULL,
+        reinterpret_cast<void*>(gn_ctor_noop),
+        nullptr
+    );
+
+    if (hook_rc != 0) {
+        result = std::string("RUNTIME PROBE: Vortek constructor hook FAILED rc=") +
+                 std::to_string(hook_rc);
+        append_log(result.c_str());
+        return;
+    }
+
+    append_log("RUNTIME PROBE: hooked Vortek init_array constructor at offset 0x6617c");
+
+    // Re-open with autoload enabled; the hook remains on the already mapped
+    // target while its declared dependencies can enter the scope.
+    void* autoload_handle = solder_dlopen(target, SOLDER_LAZY);
+    if (!autoload_handle) {
+        const char* err = solder_dlerror();
+        result = std::string("RUNTIME PROBE: target autoload dlopen FAILED: ") +
+                 (err ? err : "(no error text)");
+        append_log(result.c_str());
+        return;
+    }
+
+    target_handle = autoload_handle;
 
     if (!target_handle) {
         const char* err = solder_dlerror();
