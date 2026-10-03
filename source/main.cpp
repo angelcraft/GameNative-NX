@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <string>
 #include <elf.h>
@@ -20,6 +21,8 @@ namespace {
 // No-op constructor target used by solder_hook_offset() during diagnosis.
 // Keep C linkage-free and plain void() so it can replace a .init_array entry.
 static void gn_ctor_noop() {}
+
+
 
 constexpr const char* kRoot =
     "sdmc:/switch/gamenative_nx";
@@ -101,6 +104,145 @@ constexpr int kMaxMainExports = 4096;
 
 static solder_export_t g_main_exports[kMaxMainExports];
 static int g_main_export_count = 0;
+// V19: Vortek's native bootstrap only needs sendmsg() here to transfer the two
+// ring-buffer FDs. Horizon/libnx does not provide the Linux AF_UNIX/SCM_RIGHTS
+// transport used by Android, so the probe replaces sendmsg with a controlled
+// success shim. The ring buffers themselves still use real mmap()-backed files.
+static ssize_t gn_vortek_probe_sendmsg(
+    int sockfd,
+    const struct msghdr* msg,
+    int flags
+) {
+    (void)flags;
+
+    int fd_count = 0;
+    if (msg && msg->msg_control) {
+        const unsigned char* base =
+            static_cast<const unsigned char*>(msg->msg_control);
+        const unsigned char* end = base + msg->msg_controllen;
+
+        for (const struct cmsghdr* cmsg =
+                 CMSG_FIRSTHDR(const_cast<struct msghdr*>(msg));
+             cmsg;
+             cmsg = CMSG_NXTHDR(
+                 const_cast<struct msghdr*>(msg),
+                 const_cast<struct cmsghdr*>(cmsg))) {
+            const auto* raw =
+                reinterpret_cast<const unsigned char*>(cmsg);
+            if (raw < base || raw + sizeof(struct cmsghdr) > end)
+                break;
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SCM_RIGHTS &&
+                cmsg->cmsg_len >= CMSG_LEN(0)) {
+                fd_count = static_cast<int>(
+                    (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int)
+                );
+                break;
+            }
+        }
+    }
+
+    char line[256];
+    std::snprintf(
+        line, sizeof(line),
+        "RUNTIME PROBE V19: sendmsg shim sockfd=%d SCM_RIGHTS_fds=%d -> success",
+        sockfd, fd_count
+    );
+    append_log(line);
+
+    // send_fds() only checks result < 0. Returning one emulates the single
+    // marker byte sent by the upstream implementation when data == NULL.
+    return 1;
+}
+
+// V19: Linux Android ashmem is replaced with ordinary files. mmap(MAP_SHARED)
+// on these files has the exact property RingBuffer_create needs for this
+// bootstrap test: a writable, shared, fixed-size backing store.
+static int gn_vortek_probe_ashmemCreateRegion(
+    const char* name,
+    int64_t size
+) {
+    const char* safe_name = name ? name : "anonymous";
+    char path[512];
+    std::snprintf(
+        path, sizeof(path),
+        "%s/vortek_%s.shm",
+        kRoot,
+        safe_name
+    );
+
+    int fd = ::open(
+        path,
+        O_RDWR | O_CREAT | O_TRUNC,
+        0600
+    );
+    if (fd < 0) {
+        char line[256];
+        std::snprintf(
+            line, sizeof(line),
+            "RUNTIME PROBE V19: ashmem shim open FAILED name=%s errno=%d",
+            safe_name, errno
+        );
+        append_log(line);
+        return -1;
+    }
+
+    if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+        const int saved_errno = errno;
+        ::close(fd);
+        char line[256];
+        std::snprintf(
+            line, sizeof(line),
+            "RUNTIME PROBE V19: ashmem shim ftruncate FAILED name=%s size=%llu errno=%d",
+            safe_name,
+            static_cast<unsigned long long>(size),
+            saved_errno
+        );
+        append_log(line);
+        return -1;
+    }
+
+    char line[256];
+    std::snprintf(
+        line, sizeof(line),
+        "RUNTIME PROBE V19: ashmem shim OK name=%s size=%llu fd=%d",
+        safe_name,
+        static_cast<unsigned long long>(size),
+        fd
+    );
+    append_log(line);
+    return fd;
+}
+
+static bool replace_main_export_addr(
+    const char* name,
+    void* address
+) {
+    if (!name || !address)
+        return false;
+
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (!g_main_exports[i].name)
+            continue;
+        if (std::strcmp(name, g_main_exports[i].name) != 0)
+            continue;
+
+        g_main_exports[i].addr_rx =
+            reinterpret_cast<decltype(g_main_exports[i].addr_rx)>(address);
+        return true;
+    }
+
+    if (g_main_export_count >= kMaxMainExports)
+        return false;
+
+    solder_export_t promoted = g_main_exports[0];
+    promoted.name = name;
+    promoted.addr_rx =
+        reinterpret_cast<decltype(promoted.addr_rx)>(address);
+    g_main_exports[g_main_export_count++] = promoted;
+    return true;
+}
+
 
 bool main_export_exists(const char* name) {
     if (!name)
@@ -2523,6 +2665,29 @@ void runtime_probe_leaf_module(std::string& result) {
 
     append_log("RUNTIME PROBE: hooked Vortek init_array constructor at offset 0x6617c");
 
+    // V19: install bootstrap shims BEFORE the first target relocation.
+    void* original_sendmsg = nullptr;
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (g_main_exports[i].name &&
+            std::strcmp(g_main_exports[i].name, "sendmsg") == 0) {
+            original_sendmsg = reinterpret_cast<void*>(g_main_exports[i].addr_rx);
+            break;
+        }
+    }
+
+    append_log("RUNTIME PROBE V19: installing ashmem + sendmsg shims BEFORE target relocation");
+    if (!replace_main_export_addr("sendmsg", reinterpret_cast<void*>(gn_vortek_probe_sendmsg)) ||
+        !replace_main_export_addr("ashmemCreateRegion", reinterpret_cast<void*>(gn_vortek_probe_ashmemCreateRegion))) {
+        append_log("RUNTIME PROBE V19: failed to install bootstrap shims");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+    if (solder_set_main_exports(g_main_exports, g_main_export_count) != 0) {
+        append_log("RUNTIME PROBE V19: failed to reinstall main exports with bootstrap shims");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
     // V12 diagnostic isolation:
     // Do NOT reopen the target with autoload enabled here.
     // The target is already mapped and hooked. We now call solder_dlsym()
@@ -2547,13 +2712,19 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log(line);
     result = line;
 
-    append_log("RUNTIME PROBE V18: resolving internal createVkContextForClient bypassing JNI");
+    if (original_sendmsg) {
+        replace_main_export_addr("sendmsg", original_sendmsg);
+        solder_set_main_exports(g_main_exports, g_main_export_count);
+        append_log("RUNTIME PROBE V19: restored ordinary main sendmsg export after relocation");
+    }
+
+    append_log("RUNTIME PROBE V19: resolving internal createVkContextForClient bypassing JNI");
 
     // The internal helper is not exported in this build. Instead, inspect
     // the AArch64 instructions at the exported JNI wrapper and recover the
     // direct BL call target. The normal Vortek JNI wrapper is a tiny thunk
-    // around createVkContext(env,obj,fd,options), so this gives us the
-    // internal function without depending on its symbol visibility.
+    // around the native Vortek client bootstrap, so this gives us the
+    // internal helper without depending on its symbol visibility.
     void* create_jni = solder_dlsym(
         target_handle,
         "Java_com_winlator_xenvironment_components_VortekRendererComponent_createVkContext"
@@ -2561,7 +2732,7 @@ void runtime_probe_leaf_module(std::string& result) {
     const char* create_jni_err = solder_dlerror();
 
     if (!create_jni) {
-        append_logf("RUNTIME PROBE V18: JNI createVkContext lookup FAILED: %s",
+        append_logf("RUNTIME PROBE V19: JNI createVkContext lookup FAILED: %s",
                     create_jni_err ? create_jni_err : "(no error text)");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
@@ -2569,7 +2740,7 @@ void runtime_probe_leaf_module(std::string& result) {
 
     char create_jni_addr[256];
     std::snprintf(create_jni_addr, sizeof(create_jni_addr),
-                  "RUNTIME PROBE V18: JNI createVkContext addr=%p",
+                  "RUNTIME PROBE V19: JNI createVkContext addr=%p",
                   create_jni);
     append_log(create_jni_addr);
 
@@ -2586,7 +2757,7 @@ void runtime_probe_leaf_module(std::string& result) {
 
         char insn_line[256];
         std::snprintf(insn_line, sizeof(insn_line),
-                      "RUNTIME PROBE V18: insn[%02d] pc=%p word=0x%08x",
+                      "RUNTIME PROBE V19: insn[%02d] pc=%p word=0x%08x",
                       i, reinterpret_cast<void*>(pc), insn);
         append_log(insn_line);
 
@@ -2605,7 +2776,7 @@ void runtime_probe_leaf_module(std::string& result) {
 
         char target_line[256];
         std::snprintf(target_line, sizeof(target_line),
-                      "RUNTIME PROBE V18: recovered internal BL target=%p from instruction[%d]",
+                      "RUNTIME PROBE V19: recovered internal BL target=%p from instruction[%d]",
                       reinterpret_cast<void*>(internal_target),
                       i);
         append_log(target_line);
@@ -2613,150 +2784,17 @@ void runtime_probe_leaf_module(std::string& result) {
     }
 
     if (!internal_target) {
-        append_log("RUNTIME PROBE V18: no direct BL target found in JNI wrapper prologue");
-        append_log("RUNTIME PROBE V18: refusing direct execution; wrapper shape differs from expected thunk");
+        append_log("RUNTIME PROBE V19: no direct BL target found in JNI wrapper prologue");
+        append_log("RUNTIME PROBE V19: refusing direct execution; wrapper shape differs from expected thunk");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
     (void)internal_bl_index;
 
-    // libnx currently rejects socketpair(AF_UNIX, SOCK_STREAM, ...) with
-    // errno 88. V18 therefore creates an actual connected AF_UNIX stream via
-    // socket()/bind()/listen()/connect()/accept(), preserving SCM_RIGHTS
-    // semantics required by Vortek's send_fds().
-    int server_fd = -1;
-    int client_fd = -1;
-    int peer_fd = -1;
-    constexpr const char* kVortekSockPath =
-        "/tmp/gamenative_vortek_nx.sock";
-
-    append_log("RUNTIME PROBE V18: creating AF_UNIX stream server/client transport");
-    ::unlink(kVortekSockPath);
-
-    server_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        const int saved_errno = errno;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "RUNTIME PROBE V18: socket(server) FAILED errno=%d",
-                      saved_errno);
-        append_log(line);
-        append_log("RUNTIME PROBE V18: AF_UNIX stream transport unavailable");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-
-    // devkitA64/libnx does not ship <sys/un.h>. Define only the minimal
-    // sockaddr_un-compatible layout needed for AF_UNIX pathname sockets.
-    struct GnSockaddrUn {
-        sa_family_t sun_family;
-        char sun_path[108];
-    };
-
-    GnSockaddrUn server_addr{};
-    server_addr.sun_family = AF_UNIX;
-    if (std::strlen(kVortekSockPath) >= sizeof(server_addr.sun_path)) {
-        append_log("RUNTIME PROBE V18: socket path too long");
-        ::close(server_fd);
-        return;
-    }
-    std::strncpy(server_addr.sun_path,
-                 kVortekSockPath,
-                 sizeof(server_addr.sun_path) - 1);
-
-    if (::bind(server_fd,
-               reinterpret_cast<const struct sockaddr*>(&server_addr),
-               static_cast<socklen_t>(sizeof(server_addr))) != 0) {
-        const int saved_errno = errno;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "RUNTIME PROBE V18: bind(server) FAILED errno=%d",
-                      saved_errno);
-        append_log(line);
-        ::close(server_fd);
-        ::unlink(kVortekSockPath);
-        append_log("RUNTIME PROBE V18: AF_UNIX bind unavailable");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-    append_log("RUNTIME PROBE V18: bind(server) OK");
-
-    if (::listen(server_fd, 1) != 0) {
-        const int saved_errno = errno;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "RUNTIME PROBE V18: listen(server) FAILED errno=%d",
-                      saved_errno);
-        append_log(line);
-        ::close(server_fd);
-        ::unlink(kVortekSockPath);
-        append_log("RUNTIME PROBE V18: AF_UNIX listen unavailable");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-    append_log("RUNTIME PROBE V18: listen(server) OK");
-
-    client_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (client_fd < 0) {
-        const int saved_errno = errno;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "RUNTIME PROBE V18: socket(client) FAILED errno=%d",
-                      saved_errno);
-        append_log(line);
-        ::close(server_fd);
-        ::unlink(kVortekSockPath);
-        append_log("RUNTIME PROBE V18: client AF_UNIX socket unavailable");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-
-    if (::connect(client_fd,
-                  reinterpret_cast<const struct sockaddr*>(&server_addr),
-                  static_cast<socklen_t>(sizeof(server_addr))) != 0) {
-        const int saved_errno = errno;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "RUNTIME PROBE V18: connect(client) FAILED errno=%d",
-                      saved_errno);
-        append_log(line);
-        ::close(client_fd);
-        ::close(server_fd);
-        ::unlink(kVortekSockPath);
-        append_log("RUNTIME PROBE V18: AF_UNIX client connection unavailable");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-    append_log("RUNTIME PROBE V18: connect(client) OK");
-
-    peer_fd = ::accept(server_fd, nullptr, nullptr);
-    if (peer_fd < 0) {
-        const int saved_errno = errno;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "RUNTIME PROBE V18: accept(server) FAILED errno=%d",
-                      saved_errno);
-        append_log(line);
-        ::close(client_fd);
-        ::close(server_fd);
-        ::unlink(kVortekSockPath);
-        append_log("RUNTIME PROBE V18: AF_UNIX accept unavailable");
-        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-        return;
-    }
-
-    ::close(server_fd);
-    server_fd = -1;
-    ::unlink(kVortekSockPath);
-
-    int socket_fds[2] = {client_fd, peer_fd};
-    char socket_ok[256];
-    std::snprintf(socket_ok, sizeof(socket_ok),
-                  "RUNTIME PROBE V18: AF_UNIX stream OK clientFd=%d peerFd=%d",
-                  socket_fds[0], socket_fds[1]);
-    append_log(socket_ok);
-    append_log("RUNTIME PROBE V18: connected stream is ready for send_fds(SCM_RIGHTS)");
+    append_log("RUNTIME PROBE V19: no AF_UNIX transport required; target captured bootstrap shims");
+    const int bootstrap_fd = -1;
+    append_log("RUNTIME PROBE V19: using probe clientFd=-1");
 
     // ABI-compatible copy of VkContextOptions from Vortek's native source.
     // The direct helper accepts a NULL JMethods pointer, so this execution
@@ -2783,10 +2821,10 @@ void runtime_probe_leaf_module(std::string& result) {
     const auto create_for_client =
         reinterpret_cast<CreateVkContextForClientFn>(internal_target);
 
-    append_log("RUNTIME PROBE V18: calling recovered internal createVkContextForClient(clientFd, default Options, NULL JMethods)");
+    append_log("RUNTIME PROBE V19: calling recovered internal createVkContextForClient(clientFd, default Options, NULL JMethods)");
 
     void* context = create_for_client(
-        socket_fds[0],
+        bootstrap_fd,
         &options,
         nullptr
     );
@@ -2795,52 +2833,28 @@ void runtime_probe_leaf_module(std::string& result) {
         const int saved_errno = errno;
         char context_failed[256];
         std::snprintf(context_failed, sizeof(context_failed),
-                      "RUNTIME PROBE V18: createVkContextForClient FAILED errno=%d",
+                      "RUNTIME PROBE V19: createVkContextForClient FAILED errno=%d",
                       saved_errno);
         append_log(context_failed);
-        ::close(socket_fds[0]);
-        ::close(socket_fds[1]);
-        append_log("RUNTIME PROBE V18: transport fds closed after failed context creation");
+        append_log("RUNTIME PROBE V19: probe clientFd was synthetic (-1); nothing to close");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
     char context_ok[256];
     std::snprintf(context_ok, sizeof(context_ok),
-                  "RUNTIME PROBE V18: SUCCESS VkContext=%p",
+                  "RUNTIME PROBE V19: SUCCESS VkContext=%p",
                   context);
     append_log(context_ok);
-    append_log("RUNTIME PROBE V18: context creation reached native ring-buffer/thread bootstrap");
+    append_log("RUNTIME PROBE V19: createVkContextForClient reached native ring-buffer bootstrap");
+    append_log("RUNTIME PROBE V19: requestHandlerThread may now be running in non-JVM mode");
+    append_log("RUNTIME PROBE V19: intentionally leaving context + client fd alive until process exit");
 
-    // The peer is kept alive while the context exists because setupRingBuffers()
-    // sends the two shared-memory FDs through clientFd. We do not send any Vortek
-    // protocol packets; this pass only proves the native context bootstrap.
-    svcSleepThread(50'000'000ULL);
+    // Do not call destroyVkContext here. On the native non-JVM Vortek path the
+    // request thread is intentionally kept alive waiting on its server ring.
+    // Leaving it alive is the safest way to prove context creation without
+    // triggering teardown paths that belong to the Android/JNI host.
 
-    append_log("RUNTIME PROBE V18: resolving exported JNI destroyVkContext for cleanup");
-    void* destroy_jni = solder_dlsym(
-        target_handle,
-        "Java_com_winlator_xenvironment_components_VortekRendererComponent_destroyVkContext"
-    );
-    const char* destroy_jni_err = solder_dlerror();
-
-    if (!destroy_jni) {
-        append_logf("RUNTIME PROBE V18: JNI destroyVkContext lookup FAILED: %s",
-                    destroy_jni_err ? destroy_jni_err : "(no error text)");
-        append_log("RUNTIME PROBE V18: leaving context alive until process exit");
-    } else {
-        using DestroyJniFn = void (*)(void*, void*, long long);
-        const auto destroy_fn = reinterpret_cast<DestroyJniFn>(destroy_jni);
-        append_log("RUNTIME PROBE V18: destroying context through JNI wrapper with NULL env/obj");
-        destroy_fn(nullptr, nullptr, static_cast<long long>(reinterpret_cast<uintptr_t>(context)));
-        append_log("RUNTIME PROBE V18: context destroyed cleanly");
-    }
-
-    // destroyVkContext may own/close clientFd; do not double-close it here.
-    ::close(socket_fds[1]);
-    append_log("RUNTIME PROBE V18: peer transport fd closed (client fd ownership left to Vortek)");
-
-    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
 }
 
 } // namespace
