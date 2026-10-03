@@ -2,6 +2,8 @@
 #include <solder.h>
 #include "android_compat.hpp"
 
+extern "C" int solder_debug_relocate_all(void* handle);
+
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -1894,10 +1896,10 @@ void batch_audit_all_sos(std::string& result) {
     result.clear();
 
     append_log("============================================================");
-    append_log("BATCH AUDIT V4: preload bundled dependencies + relocation smoke (safe dlsym diagnostics)");
+    append_log("BATCH AUDIT V5: preload bundled dependencies + BULK relocation diagnostics");
     append_log("All ARM64 .so files are loaded first with lazy auto-dependency discovery.");
-    append_log("Then selected bundled-dependency modules are forced to relocate.");
-    append_log("No arbitrary exported functions are called.");
+    append_log("Then every loaded module is forced through a non-initializing relocation pass.");
+    append_log("No arbitrary exported functions or init routines are called by the diagnostic.");
     append_log("============================================================");
 
     DIR* dir = opendir(kNativeDir);
@@ -1986,93 +1988,39 @@ void batch_audit_all_sos(std::string& result) {
                 " loaded=" + std::to_string(loaded_count) +
                 " failed=" + std::to_string(load_fail_count)).c_str());
 
-    // Phase 2: force relocation of modules whose DT_NEEDED includes other
-    // bundled GameNative libraries. Their dependencies should already have
-    // been discovered/linked by the Phase 1 auto-load pass. We deliberately
-    // ask for an exported
-    // symbol but never call it. dlsym() on a lazy module forces its relocation
-    // and initialization, so a successful address is a real linker smoke test.
-    struct RelocProbe {
-        const char* module;
-        const char* symbol;
-    };
+    // Phase 2: BULK relocation diagnostic.
+    // Instead of dlsym()-ing one symbol per module (which stops at the first
+    // unresolved import), ask libsolder to run a non-initializing relocation
+    // pass with ignore_undef=1. libsolder will continue through ALL RELA/JMPREL
+    // entries and DEBUG_PRINTF every unresolved symbol.
+    int bulk_reloc_ok = 0;
+    int bulk_reloc_fail = 0;
 
-    static const RelocProbe probes[] = {
-        {"libpulsecommon-13.0.so", "pa_idxset_string_compare_func"},
-        {"libpulse.so", "pa_ext_device_restore_test"},
-        {"libpulsecore-13.0.so", "pa_source_get_latency"},
-        {"libpulseaudio.so", "pa_cmdline_help"},
-        {"libhook_impl.so", "linkernsbypass_namespace_dlopen_unique"},
-        {"libmain_hook.so", "android_dlopen_ext"},
-        {"libvortekrenderer.so", "vt_handle_vkDestroyPipelineLayout"},
-    };
+    append_log("BULK RELOC: begin all-modules relocation with unresolved-import logging");
 
-    int reloc_ok = 0;
-    int reloc_fail = 0;
-    int reloc_skipped = 0;
+    for (size_t i = 0; i < loaded_count; ++i) {
+        const std::string& name = loaded[i].name;
 
-    for (const RelocProbe& probe : probes) {
-        void* handle = nullptr;
+        append_log(("BULK RELOC [" + std::to_string(i + 1) + "/" +
+                    std::to_string(loaded_count) + "] " + name +
+                    " : starting").c_str());
 
-        for (size_t i = 0; i < loaded_count; ++i) {
-            if (loaded[i].name == probe.module) {
-                handle = loaded[i].handle;
-                break;
-            }
-        }
+        const int rc = solder_debug_relocate_all(loaded[i].handle);
 
-        if (!handle) {
-            ++reloc_skipped;
-            append_log((std::string("RELOC ") + probe.module +
-                        " : SKIPPED (module not loaded)").c_str());
-            continue;
-        }
-
-        const std::string reloc_msg =
-            std::string("RELOC ") + probe.module +
-            " : before dlsym(" + probe.symbol + ")";
-        append_log(reloc_msg.c_str());
-
-        void* symbol = solder_dlsym(handle, probe.symbol);
-        const char* err = solder_dlerror();
-
-        if (symbol) {
-            ++reloc_ok;
-
-            char line[256];
-            std::snprintf(
-                line,
-                sizeof(line),
-                "RELOC %s : SUCCESS symbol=%s addr=%s",
-                probe.module,
-                probe.symbol,
-                hex_addr(symbol).c_str()
-            );
-            append_log(line);
-
-            result +=
-                std::string("RELOC OK: ") +
-                probe.module +
-                " -> " +
-                probe.symbol +
-                "\n";
+        if (rc == 0) {
+            ++bulk_reloc_ok;
+            append_log(("BULK RELOC " + name + " : OK (all unresolved imports were logged)").c_str());
+            result += "BULK RELOC OK: " + name + "\n";
         } else {
-            ++reloc_fail;
-
-            append_logf(
-                (std::string("RELOC ") + probe.module +
-                 " : FAILED: %s").c_str(),
-                err ? err : "(no error text)"
-            );
-
-            result +=
-                std::string("RELOC FAIL: ") +
-                probe.module +
-                " -> " +
-                (err ? err : "(no error text)") +
-                "\n";
+            ++bulk_reloc_fail;
+            append_log(("BULK RELOC " + name + " : FAILED rc=" +
+                        std::to_string(rc)).c_str());
+            result += "BULK RELOC FAIL: " + name + " rc=" +
+                      std::to_string(rc) + "\n";
         }
     }
+
+    append_log("BULK RELOC: finished; inspect libsolder resolution-failed lines for complete missing-import inventory");
 
     // DIAGNOSTIC MODE: do not dlclose here.
     // This keeps the test isolated from refcount/unload behavior.
@@ -2083,13 +2031,12 @@ void batch_audit_all_sos(std::string& result) {
     std::snprintf(
         summary,
         sizeof(summary),
-        "BATCH V3 SUMMARY: files=%zu loaded=%zu load_fail=%d reloc_ok=%d reloc_fail=%d reloc_skipped=%d",
+        "BATCH V5 SUMMARY: files=%zu loaded=%zu load_fail=%d bulk_reloc_ok=%d bulk_reloc_fail=%d",
         count,
         loaded_count,
         load_fail_count,
-        reloc_ok,
-        reloc_fail,
-        reloc_skipped
+        bulk_reloc_ok,
+        bulk_reloc_fail
     );
 
     append_log(summary);
