@@ -2460,7 +2460,6 @@ static const solder_export_t kAndroidCompatExports[] = {
     SOLDER_EXPORT("lseek64", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("lstat64", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("madvise", (void*)&gn_android_unimplemented),
-    SOLDER_EXPORT("main", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("memfd_create", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("mkstemp64", (void*)&gn_android_unimplemented),
     SOLDER_EXPORT("mlock", (void*)&gn_android_unimplemented),
