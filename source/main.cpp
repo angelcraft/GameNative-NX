@@ -1894,14 +1894,16 @@ void batch_audit_all_sos(std::string& result) {
     result.clear();
 
     append_log("============================================================");
-    append_log("BATCH AUDIT: ARM64 .so inventory + lazy load");
-    append_log("No relocation/execution is attempted in this pass.");
+    append_log("BATCH AUDIT V3: preload bundled dependencies + relocation smoke");
+    append_log("All ARM64 .so files are loaded first with lazy/no-autoload.");
+    append_log("Then selected bundled-dependency modules are forced to relocate.");
+    append_log("No arbitrary exported functions are called.");
     append_log("============================================================");
 
     DIR* dir = opendir(kNativeDir);
     if (!dir) {
         result = "FAILED: cannot open native directory\n";
-        append_log("BATCH AUDIT: opendir FAILED");
+        append_log("BATCH AUDIT V3: opendir FAILED");
         return;
     }
 
@@ -1924,7 +1926,6 @@ void batch_audit_all_sos(std::string& result) {
 
     closedir(dir);
 
-    // Stable alphabetical order without depending on std::sort.
     for (size_t i = 0; i < count; ++i) {
         for (size_t j = i + 1; j < count; ++j) {
             if (names[j] < names[i]) {
@@ -1935,132 +1936,157 @@ void batch_audit_all_sos(std::string& result) {
         }
     }
 
+    struct LoadedModule {
+        std::string name;
+        void* handle;
+    };
+
+    LoadedModule loaded[64];
+    size_t loaded_count = 0;
+    int load_fail_count = 0;
+
     result += "Found " + std::to_string(count) + " ARM64 .so files\n\n";
 
-    int load_ok_count = 0;
-    int load_fail_count = 0;
-    int static_ok_count = 0;
-    int static_fail_count = 0;
-    int total_undefined = 0;
-    int total_missing = 0;
-
+    // Phase 1: preload every bundled module and KEEP it alive.
+    // This makes symbols exported by bundled internal dependencies visible
+    // to later relocations, while Android/Unix symbols still come from the
+    // combined main export table.
     for (size_t i = 0; i < count; ++i) {
         const std::string& name = names[i];
 
-        std::string path =
-            std::string(kNativeDir) + "/" + name;
-
-        append_log(("BATCH [" + std::to_string(i + 1) + "/" +
+        append_log(("PRELOAD [" + std::to_string(i + 1) + "/" +
                     std::to_string(count) + "] " + name +
-                   " : lazy load start").c_str());
+                    " : starting").c_str());
 
-        void* handle =
-            solder_dlopen(
-                name.c_str(),
-                SOLDER_LAZY | SOLDER_NO_AUTOLOAD
-            );
+        void* handle = solder_dlopen(
+            name.c_str(),
+            SOLDER_LAZY | SOLDER_NO_AUTOLOAD
+        );
 
         const char* load_err = solder_dlerror();
 
         if (!handle) {
             ++load_fail_count;
-            result += name + " : LOAD FAIL\n";
             append_logf(
-                ("BATCH " + name + " : LOAD FAIL: %s").c_str(),
+                ("PRELOAD " + name + " : FAILED: %s").c_str(),
                 load_err ? load_err : "(no error text)"
             );
             continue;
         }
 
-        ++load_ok_count;
+        loaded[loaded_count].name = name;
+        loaded[loaded_count].handle = handle;
+        ++loaded_count;
 
-        std::string symbol_screen;
-        std::string symbol_full;
-        const bool symbols_ok =
-            inspect_undefined_symbols(
-                path.c_str(),
-                symbol_screen,
-                symbol_full
-            );
+        append_log(("PRELOAD " + name + " : OK").c_str());
+    }
 
-        if (!symbols_ok) {
-            ++static_fail_count;
-            result += name + " : LOAD OK / SYMBOL INSPECT FAIL\n";
-            append_logf(
-                ("BATCH " + name + " : symbol inspection FAILED: %s").c_str(),
-                symbol_full.c_str()
-            );
-        } else {
-            ++static_ok_count;
+    append_log(("PRELOAD SUMMARY: requested=" + std::to_string(count) +
+                " loaded=" + std::to_string(loaded_count) +
+                " failed=" + std::to_string(load_fail_count)).c_str());
 
-            int undef = 0;
-            int missing = 0;
-            const std::string prefix = "UNDEFINED COUNT: ";
-            if (symbol_full.rfind(prefix, 0) == 0) {
-                const size_t nl = symbol_full.find('\n');
-                if (nl != std::string::npos) {
-                    undef = std::atoi(
-                        symbol_full.substr(prefix.size(), nl - prefix.size()).c_str()
-                    );
-                }
+    // Phase 2: force relocation of modules whose DT_NEEDED includes other
+    // bundled GameNative libraries. We deliberately ask for an exported
+    // symbol but never call it. dlsym() on a lazy module forces its relocation
+    // and initialization, so a successful address is a real linker smoke test.
+    struct RelocProbe {
+        const char* module;
+        const char* symbol;
+    };
+
+    static const RelocProbe probes[] = {
+        {"libpulsecommon-13.0.so", "pa_idxset_string_compare_func"},
+        {"libpulse.so", "pa_ext_device_restore_test"},
+        {"libpulsecore-13.0.so", "pa_source_get_latency"},
+        {"libpulseaudio.so", "pa_cmdline_help"},
+        {"libhook_impl.so", "linkernsbypass_namespace_dlopen_unique"},
+        {"libmain_hook.so", "android_dlopen_ext"},
+        {"libvortekrenderer.so", "vt_handle_vkDestroyPipelineLayout"},
+    };
+
+    int reloc_ok = 0;
+    int reloc_fail = 0;
+    int reloc_skipped = 0;
+
+    for (const RelocProbe& probe : probes) {
+        void* handle = nullptr;
+
+        for (size_t i = 0; i < loaded_count; ++i) {
+            if (loaded[i].name == probe.module) {
+                handle = loaded[i].handle;
+                break;
             }
+        }
 
-            size_t pos = 0;
-            while ((pos = symbol_full.find("    MISSING", pos)) != std::string::npos) {
-                ++missing;
-                pos += 12;
-            }
+        if (!handle) {
+            ++reloc_skipped;
+            append_log((std::string("RELOC ") + probe.module +
+                        " : SKIPPED (module not loaded)").c_str());
+            continue;
+        }
 
-            total_undefined += undef;
-            total_missing += missing;
+        append_log((std::string("RELOC ") + probe.module +
+                    " : before dlsym(") + probe.symbol + ")").c_str());
+
+        void* symbol = solder_dlsym(handle, probe.symbol);
+        const char* err = solder_dlerror();
+
+        if (symbol) {
+            ++reloc_ok;
+
+            char line[256];
+            std::snprintf(
+                line,
+                sizeof(line),
+                "RELOC %s : SUCCESS symbol=%s addr=%s",
+                probe.module,
+                probe.symbol,
+                hex_addr(symbol).c_str()
+            );
+            append_log(line);
 
             result +=
-                name +
-                " : LOAD OK / undefined=" +
-                std::to_string(undef) +
-                " missing=" +
-                std::to_string(missing) +
+                std::string("RELOC OK: ") +
+                probe.module +
+                " -> " +
+                probe.symbol +
                 "\n";
+        } else {
+            ++reloc_fail;
 
-            char batch_line[192];
-            std::snprintf(
-                batch_line,
-                sizeof(batch_line),
-                "BATCH %s : LOAD OK undefined=%d missing=%d",
-                name.c_str(),
-                undef,
-                missing
-            );
-            append_log(batch_line);
-
-            // The helper already marks every symbol DEFAULT/MISSING.
-            // Keep the full list in the debug log for the compatibility pass.
-            append_log(("BATCH " + name + " : STATIC SYMBOLS").c_str());
-            append_log(symbol_full.c_str());
-        }
-
-        solder_dlclose(handle);
-        const char* close_err = solder_dlerror();
-        if (close_err) {
             append_logf(
-                ("BATCH " + name + " : close warning: %s").c_str(),
-                close_err
+                (std::string("RELOC ") + probe.module +
+                 " : FAILED: %s").c_str(),
+                err ? err : "(no error text)"
             );
+
+            result +=
+                std::string("RELOC FAIL: ") +
+                probe.module +
+                " -> " +
+                (err ? err : "(no error text)") +
+                "\n";
         }
+    }
+
+    // Keep modules alive until all probes are complete, then close them in
+    // reverse order.
+    for (size_t i = loaded_count; i > 0; --i) {
+        solder_dlclose(loaded[i - 1].handle);
+        (void)solder_dlerror();
     }
 
     char summary[256];
     std::snprintf(
         summary,
         sizeof(summary),
-        "BATCH SUMMARY: files=%zu load_ok=%d load_fail=%d symbol_ok=%d symbol_fail=%d total_undefined=%d total_missing=%d",
+        "BATCH V3 SUMMARY: files=%zu loaded=%zu load_fail=%d reloc_ok=%d reloc_fail=%d reloc_skipped=%d",
         count,
-        load_ok_count,
+        loaded_count,
         load_fail_count,
-        static_ok_count,
-        static_fail_count,
-        total_undefined,
-        total_missing
+        reloc_ok,
+        reloc_fail,
+        reloc_skipped
     );
 
     append_log(summary);
