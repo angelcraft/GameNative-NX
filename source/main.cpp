@@ -2781,7 +2781,11 @@ void runtime_probe_leaf_module(std::string& result) {
     void* native_create = solder_dlsym(target_handle, "createVkContext");
     const char* native_create_err = solder_dlerror();
     if (native_create) {
-        append_logf("RUNTIME PROBE V22: createVkContext SYMBOL SUCCESS addr=%p", native_create);
+        char native_line[256];
+        std::snprintf(native_line, sizeof(native_line),
+                      "RUNTIME PROBE V23: createVkContext SYMBOL SUCCESS addr=%p",
+                      native_create);
+        append_log(native_line);
         const uintptr_t native_pc = reinterpret_cast<uintptr_t>(native_create);
         for (int i = 0; i < 96; ++i) {
             const uintptr_t pc2 = native_pc + static_cast<uintptr_t>(i * 4);
@@ -2791,12 +2795,18 @@ void runtime_probe_leaf_module(std::string& result) {
             if (imm26_2 & (1LL << 25)) imm26_2 |= ~((1LL << 26) - 1);
             const intptr_t off2 = static_cast<intptr_t>(imm26_2 << 2);
             const uintptr_t tgt2 = static_cast<uintptr_t>(static_cast<intptr_t>(pc2) + off2);
-            append_logf("RUNTIME PROBE V22: native createVkContext BL[%d] pc=%p -> %p",
-                        i, reinterpret_cast<void*>(pc2), reinterpret_cast<void*>(tgt2));
+            char bl_line[256];
+            std::snprintf(bl_line, sizeof(bl_line),
+                          "RUNTIME PROBE V23: native createVkContext BL[%d] pc=%p -> %p",
+                          i, reinterpret_cast<void*>(pc2), reinterpret_cast<void*>(tgt2));
+            append_log(bl_line);
         }
     } else {
-        append_logf("RUNTIME PROBE V22: createVkContext SYMBOL FAILED: %s",
-                    native_create_err ? native_create_err : "(no error text)");
+        char err_line[512];
+        std::snprintf(err_line, sizeof(err_line),
+                      "RUNTIME PROBE V23: createVkContext SYMBOL FAILED: %s",
+                      native_create_err ? native_create_err : "(no error text)");
+        append_log(err_line);
     }
 
     append_log("RUNTIME PROBE V19: resolving internal createVkContextForClient bypassing JNI");
