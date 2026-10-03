@@ -2777,6 +2777,28 @@ void runtime_probe_leaf_module(std::string& result) {
         append_log("RUNTIME PROBE V19: restored ordinary main sendmsg export after relocation");
     }
 
+    append_log("RUNTIME PROBE V22: resolving native createVkContext by symbol only (NO CALL)");
+    void* native_create = solder_dlsym(target_handle, "createVkContext");
+    const char* native_create_err = solder_dlerror();
+    if (native_create) {
+        append_logf("RUNTIME PROBE V22: createVkContext SYMBOL SUCCESS addr=%p", native_create);
+        const uintptr_t native_pc = reinterpret_cast<uintptr_t>(native_create);
+        for (int i = 0; i < 96; ++i) {
+            const uintptr_t pc2 = native_pc + static_cast<uintptr_t>(i * 4);
+            const uint32_t insn2 = *reinterpret_cast<const uint32_t*>(pc2);
+            if ((insn2 & 0xFC000000u) != 0x94000000u) continue;
+            int64_t imm26_2 = static_cast<int64_t>(insn2 & 0x03FFFFFFu);
+            if (imm26_2 & (1LL << 25)) imm26_2 |= ~((1LL << 26) - 1);
+            const intptr_t off2 = static_cast<intptr_t>(imm26_2 << 2);
+            const uintptr_t tgt2 = static_cast<uintptr_t>(static_cast<intptr_t>(pc2) + off2);
+            append_logf("RUNTIME PROBE V22: native createVkContext BL[%d] pc=%p -> %p",
+                        i, reinterpret_cast<void*>(pc2), reinterpret_cast<void*>(tgt2));
+        }
+    } else {
+        append_logf("RUNTIME PROBE V22: createVkContext SYMBOL FAILED: %s",
+                    native_create_err ? native_create_err : "(no error text)");
+    }
+
     append_log("RUNTIME PROBE V19: resolving internal createVkContextForClient bypassing JNI");
 
     // The internal helper is not exported in this build. Instead, inspect
@@ -2880,7 +2902,9 @@ void runtime_probe_leaf_module(std::string& result) {
     const auto create_for_client =
         reinterpret_cast<CreateVkContextForClientFn>(internal_target);
 
-    append_log("RUNTIME PROBE V21: calling recovered internal createVkContextForClient with request thread blocked");
+    append_log("RUNTIME PROBE V22: STOPPING BEFORE ANY RECOVERED TARGET CALL; symbol/BL inspection only");
+    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+    return;
 
     void* context = create_for_client(
         bootstrap_fd,
