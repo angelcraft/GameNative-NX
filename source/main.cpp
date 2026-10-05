@@ -2864,63 +2864,225 @@ void runtime_probe_leaf_module(std::string& result) {
         }
     }
 
-    append_log("RUNTIME PROBE V28: identify native createVkContext call chain (NO CALL)");
+    append_log("RUNTIME PROBE V29: focused native call-chain + BLR/branch tracing (NO CALL)");
 
-    auto resolve_plt_got_probe = [&](uintptr_t plt) -> uintptr_t {
-        if (!plt)
-            return 0;
-
-        uint32_t a = 0, l = 0, ad = 0, br = 0;
-        std::memcpy(&a, reinterpret_cast<const void*>(plt + 0), sizeof(a));
-        std::memcpy(&l, reinterpret_cast<const void*>(plt + 4), sizeof(l));
-        std::memcpy(&ad, reinterpret_cast<const void*>(plt + 8), sizeof(ad));
-        std::memcpy(&br, reinterpret_cast<const void*>(plt + 12), sizeof(br));
-
-        const bool is_adrp = (a & 0x9F000000U) == 0x90000000U;
-        const bool is_ldr_x17 = (l & 0xFFC00000U) == 0xF9400000U &&
-                                ((l >> 5) & 0x1FU) == 16 &&
-                                (l & 0x1FU) == 17;
-        const bool is_add_x16_x16 = (ad & 0xFF00001FU) == 0x91000010U;
-        const bool is_br_x17 = br == 0xD61F0220U;
-
-        char line2[256];
-        if (!(is_adrp && is_ldr_x17 && is_add_x16_x16 && is_br_x17)) {
-            std::snprintf(line2, sizeof(line2),
-                          "RUNTIME PROBE V28: target=%p is not expected PLT form words=%08x %08x %08x %08x",
-                          reinterpret_cast<void*>(plt), a, l, ad, br);
-            append_log(line2);
-            return 0;
-        }
-
-        int64_t imm21 = static_cast<int64_t>(((a >> 5) & 0x7FFFFU) << 2 | ((a >> 29) & 0x3U));
-        if (imm21 & (1LL << 20))
-            imm21 -= (1LL << 21);
-
-        const uintptr_t page = plt & ~static_cast<uintptr_t>(0xFFFU);
-        const uintptr_t x16_page = page + (static_cast<int64_t>(imm21) << 12);
-        const uintptr_t got = x16_page + (static_cast<uintptr_t>((l >> 10) & 0xFFFU) << 3);
-        const uint64_t target64 = *reinterpret_cast<const uint64_t*>(got);
-
-        std::snprintf(line2, sizeof(line2),
-                      "RUNTIME PROBE V28: PLT=%p GOT=%p RESOLVED=%p",
-                      reinterpret_cast<void*>(plt),
-                      reinterpret_cast<void*>(got),
-                      reinterpret_cast<void*>(static_cast<uintptr_t>(target64)));
-        append_log(line2);
-
-        return static_cast<uintptr_t>(target64);
+    auto is_bl = [](uint32_t insn) -> bool {
+        return (insn & 0xFC000000U) == 0x94000000U;
+    };
+    auto decode_bl = [](uintptr_t pc, uint32_t insn) -> uintptr_t {
+        int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
+        if (imm26 & 0x02000000)
+            imm26 |= static_cast<int32_t>(0xFC000000U);
+        return pc + (static_cast<int64_t>(imm26) << 2);
+    };
+    auto is_b = [](uint32_t insn) -> bool {
+        return (insn & 0x7C000000U) == 0x14000000U;
+    };
+    auto decode_b = [](uintptr_t pc, uint32_t insn) -> uintptr_t {
+        int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
+        if (imm26 & 0x02000000)
+            imm26 |= static_cast<int32_t>(0xFC000000U);
+        return pc + (static_cast<int64_t>(imm26) << 2);
+    };
+    auto is_blr = [](uint32_t insn) -> bool {
+        return (insn & 0xFFFFFC1FU) == 0xD63F0000U;
+    };
+    auto blr_reg = [](uint32_t insn) -> unsigned {
+        return (insn >> 5) & 0x1FU;
     };
 
-    // V23 already resolved createVkContext above. Reuse that pointer here;
-    // do not perform a second dlsym or redeclare the same variables.
+    auto dump_window = [&](const char* tag, uintptr_t base, int count) {
+        char line2[256];
+        for (int i = 0; i < count; ++i) {
+            const uintptr_t pc = base + static_cast<uintptr_t>(i * 4);
+            uint32_t word = 0;
+            std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
+            std::snprintf(line2, sizeof(line2),
+                          "RUNTIME PROBE V29: %s insn[%03d] pc=%p word=0x%08x",
+                          tag, i, reinterpret_cast<void*>(pc), word);
+            append_log(line2);
+        }
+    };
+
+    auto follow_branch_chain = [&](uintptr_t start_addr) -> uintptr_t {
+        uintptr_t cur = start_addr;
+        char line2[256];
+
+        for (int hop = 0; hop < 4; ++hop) {
+            uint32_t w0 = 0;
+            std::memcpy(&w0, reinterpret_cast<const void*>(cur), sizeof(w0));
+
+            if (is_b(w0)) {
+                const uintptr_t next = decode_b(cur, w0);
+                std::snprintf(line2, sizeof(line2),
+                              "RUNTIME PROBE V29: FOLLOW B hop=%d %p -> %p",
+                              hop, reinterpret_cast<void*>(cur), reinterpret_cast<void*>(next));
+                append_log(line2);
+                cur = next;
+                continue;
+            }
+
+            // Common AArch64 veneer: ADRP/LDR/ADD/BR X17.
+            uint32_t w1 = 0, w2 = 0, w3 = 0;
+            std::memcpy(&w1, reinterpret_cast<const void*>(cur + 4), sizeof(w1));
+            std::memcpy(&w2, reinterpret_cast<const void*>(cur + 8), sizeof(w2));
+            std::memcpy(&w3, reinterpret_cast<const void*>(cur + 12), sizeof(w3));
+
+            const bool is_adrp = (w0 & 0x9F000000U) == 0x90000000U;
+            const bool is_ldr_x17 = (w1 & 0xFFC00000U) == 0xF9400000U &&
+                                    ((w1 >> 5) & 0x1FU) == 16 &&
+                                    (w1 & 0x1FU) == 17;
+            const bool is_add_x16_x16 = (w2 & 0xFF00001FU) == 0x91000010U;
+            const bool is_br_x17 = w3 == 0xD61F0220U;
+
+            if (is_adrp && is_ldr_x17 && is_add_x16_x16 && is_br_x17) {
+                int64_t imm21 = static_cast<int64_t>(((w0 >> 5) & 0x7FFFFU) << 2 | ((w0 >> 29) & 0x3U));
+                if (imm21 & (1LL << 20))
+                    imm21 -= (1LL << 21);
+
+                const uintptr_t page = cur & ~static_cast<uintptr_t>(0xFFFU);
+                const uintptr_t x16_page = page + (static_cast<int64_t>(imm21) << 12);
+                const uintptr_t got = x16_page + (static_cast<uintptr_t>((w1 >> 10) & 0xFFFU) << 3);
+                const uintptr_t next = static_cast<uintptr_t>(*reinterpret_cast<const uint64_t*>(got));
+
+                std::snprintf(line2, sizeof(line2),
+                              "RUNTIME PROBE V29: FOLLOW PLT/GOT hop=%d %p GOT=%p -> %p",
+                              hop, reinterpret_cast<void*>(cur), reinterpret_cast<void*>(got),
+                              reinterpret_cast<void*>(next));
+                append_log(line2);
+                if (!next || next == cur)
+                    break;
+                cur = next;
+                continue;
+            }
+
+            break;
+        }
+
+        return cur;
+    };
+
+    // V23 has already resolved the native symbol.
     if (!native_create) {
-        char line2[512];
-        std::snprintf(line2, sizeof(line2),
-                      "RUNTIME PROBE V28: createVkContext SYMBOL FAILED: %s",
-                      native_create_err ? native_create_err : "(no error text)");
-        append_log(line2);
-        append_log("RUNTIME PROBE V28: refusing all target execution");
+        append_log("RUNTIME PROBE V29: createVkContext unavailable; refusing execution");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    char line2[256];
+    std::snprintf(line2, sizeof(line2),
+                  "RUNTIME PROBE V29: createVkContext=%p JNI=%p",
+                  native_create, resolved);
+    append_log(line2);
+
+    // Inspect the JNI wrapper's indirect-call sites. The native call is not
+    // required to be a direct BL, so record every BLR and nearby setup.
+    if (resolved) {
+        const uintptr_t jni_pc = reinterpret_cast<uintptr_t>(resolved);
+        append_log("RUNTIME PROBE V29: scanning JNI BLR/BL call sites");
+
+        for (int i = 0; i < 160; ++i) {
+            const uintptr_t pc = jni_pc + static_cast<uintptr_t>(i * 4);
+            uint32_t insn = 0;
+            std::memcpy(&insn, reinterpret_cast<const void*>(pc), sizeof(insn));
+
+            if (is_blr(insn)) {
+                const unsigned reg = blr_reg(insn);
+                std::snprintf(line2, sizeof(line2),
+                              "RUNTIME PROBE V29: JNI BLR[%d] pc=%p reg=X%u",
+                              i, reinterpret_cast<void*>(pc), reg);
+                append_log(line2);
+
+                const int begin = (i > 8) ? i - 8 : 0;
+                for (int j = begin; j < i; ++j) {
+                    uint32_t prev = 0;
+                    const uintptr_t ppc = jni_pc + static_cast<uintptr_t>(j * 4);
+                    std::memcpy(&prev, reinterpret_cast<const void*>(ppc), sizeof(prev));
+                    std::snprintf(line2, sizeof(line2),
+                                  "RUNTIME PROBE V29: JNI PREBLR[%03d] pc=%p word=0x%08x",
+                                  j, reinterpret_cast<void*>(ppc), prev);
+                    append_log(line2);
+                }
+            }
+        }
+    }
+
+    // Inspect the real exported createVkContext itself, collecting both
+    // direct calls and indirect BLR call sites. This is the function that
+    // upstream translates from Java options before creating the client context.
+    const uintptr_t create_pc = reinterpret_cast<uintptr_t>(native_create);
+    append_log("RUNTIME PROBE V29: scanning native createVkContext BL + BLR sites");
+
+    uintptr_t call_targets[64]{};
+    int call_count = 0;
+
+    for (int i = 0; i < 192; ++i) {
+        const uintptr_t pc = create_pc + static_cast<uintptr_t>(i * 4);
+        uint32_t insn = 0;
+        std::memcpy(&insn, reinterpret_cast<const void*>(pc), sizeof(insn));
+
+        if (is_bl(insn)) {
+            const uintptr_t dst = decode_bl(pc, insn);
+            std::snprintf(line2, sizeof(line2),
+                          "RUNTIME PROBE V29: CREATE BL[%d] pc=%p -> %p",
+                          i, reinterpret_cast<void*>(pc), reinterpret_cast<void*>(dst));
+            append_log(line2);
+
+            bool seen = false;
+            for (int k = 0; k < call_count; ++k) {
+                if (call_targets[k] == dst) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && call_count < 64)
+                call_targets[call_count++] = dst;
+        }
+
+        if (is_blr(insn)) {
+            const unsigned reg = blr_reg(insn);
+            std::snprintf(line2, sizeof(line2),
+                          "RUNTIME PROBE V29: CREATE BLR[%d] pc=%p reg=X%u",
+                          i, reinterpret_cast<void*>(pc), reg);
+            append_log(line2);
+
+            const int begin = (i > 10) ? i - 10 : 0;
+            for (int j = begin; j < i; ++j) {
+                uint32_t prev = 0;
+                const uintptr_t ppc = create_pc + static_cast<uintptr_t>(j * 4);
+                std::memcpy(&prev, reinterpret_cast<const void*>(ppc), sizeof(prev));
+                std::snprintf(line2, sizeof(line2),
+                              "RUNTIME PROBE V29: CREATE PREBLR[%03d] pc=%p word=0x%08x",
+                              j, reinterpret_cast<void*>(ppc), prev);
+                append_log(line2);
+            }
+        }
+
+        // Stop at a conventional function return once we've seen the first
+        // meaningful body. This prevents wandering into unrelated sections.
+        if (i > 12 && insn == 0xD65F03C0U)
+            break;
+    }
+
+    append_log("RUNTIME PROBE V29: following native createVkContext direct-call destinations");
+
+    for (int cidx = 0; cidx < call_count; ++cidx) {
+        const uintptr_t candidate = call_targets[cidx];
+        const uintptr_t real = follow_branch_chain(candidate);
+
+        std::snprintf(line2, sizeof(line2),
+                      "RUNTIME PROBE V29: CALL TARGET[%d] candidate=%p real=%p",
+                      cidx, reinterpret_cast<void*>(candidate), reinterpret_cast<void*>(real));
+        append_log(line2);
+
+        // For the first few candidates, dump enough to catch a veneer/hot
+        // body split and locate the first BL/BLR without executing it.
+        if (cidx < 12)
+            dump_window("CALL TARGET", real, 48);
+    }
+
+    append_log("RUNTIME PROBE V29: focused call-chain inspection complete; refusing all target execution");
+    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
