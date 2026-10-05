@@ -113,36 +113,29 @@ static PthreadCreateProbeFn g_vortek_probe_original_pthread_create = nullptr;
 static int g_vortek_probe_pthread_create_count = 0;
 static int gn_vortek_probe_pthread_create(
     pthread_t* thread,
-    const pthread_attr_t*,
-    void* (*)(void*),
-    void*) {
-    if (thread)
-        std::memset(thread, 0, sizeof(*thread));
-
+    const pthread_attr_t* attr,
+    void* (*start_routine)(void*),
+    void* arg) {
     const int call_index =
         __atomic_add_fetch(&g_vortek_probe_pthread_create_count, 1, __ATOMIC_SEQ_CST);
 
-    append_log(("RUNTIME PROBE V35: pthread_create suppressed #" +
+    // Upstream ThreadPool_init() creates 8 workers, then setupRingBuffers()
+    // creates the 9th thread for requestHandlerThread. Let the eight workers
+    // use real pthreads so their lifecycle/worker counters remain coherent.
+    if (call_index <= 8 && g_vortek_probe_original_pthread_create) {
+        const int rc =
+            g_vortek_probe_original_pthread_create(thread, attr, start_routine, arg);
+        append_log(("RUNTIME PROBE V35: pthread_create real worker #" +
+                    std::to_string(call_index) + " rc=" +
+                    std::to_string(rc)).c_str());
+        return rc;
+    }
+
+    if (thread)
+        std::memset(thread, 0, sizeof(*thread));
+
+    append_log(("RUNTIME PROBE V35: pthread_create suppressed request-handler #" +
                 std::to_string(call_index)).c_str());
-    return 0;
-}
-
-static int gn_vortek_probe_pthread_detach(pthread_t) {
-    append_log("RUNTIME PROBE V35: pthread_detach suppressed");
-    return 0;
-}
-
-static int gn_vortek_probe_pthread_mutex_init(
-    pthread_mutex_t*,
-    const pthread_mutexattr_t*) {
-    append_log("RUNTIME PROBE V35: pthread_mutex_init suppressed");
-    return 0;
-}
-
-static int gn_vortek_probe_pthread_cond_init(
-    pthread_cond_t*,
-    const pthread_condattr_t*) {
-    append_log("RUNTIME PROBE V35: pthread_cond_init suppressed");
     return 0;
 }
 
@@ -2757,13 +2750,13 @@ void runtime_probe_leaf_module(std::string& result) {
     // solder_dlsym() triggers/uses the target's lazy relocations.
     replace_main_export_addr(
         "pthread_detach",
-        reinterpret_cast<void*>(&gn_vortek_probe_pthread_detach));
+        reinterpret_cast<void*>(&gn_android_pthread_detach));
     replace_main_export_addr(
         "pthread_mutex_init",
-        reinterpret_cast<void*>(&gn_vortek_probe_pthread_mutex_init));
+        reinterpret_cast<void*>(&gn_android_pthread_mutex_init));
     replace_main_export_addr(
         "pthread_cond_init",
-        reinterpret_cast<void*>(&gn_vortek_probe_pthread_cond_init));
+        reinterpret_cast<void*>(&gn_android_pthread_cond_init));
     replace_main_export_addr(
         "mmap",
         reinterpret_cast<void*>(&gn_android_mmap));
@@ -2801,12 +2794,8 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log(line);
     result = line;
 
-    if (original_sendmsg) {
-        replace_main_export_addr("sendmsg", original_sendmsg);
-        solder_set_main_exports(g_main_exports, g_main_export_count);
-        append_log("RUNTIME PROBE V19: restored ordinary main sendmsg export after relocation");
-    }
-
+    // Keep the sendmsg shim installed through V35 execution because
+    // setupRingBuffers() still calls send_fds() using the synthetic fd.
     append_log("RUNTIME PROBE V22: resolving native createVkContext by symbol only (NO CALL)");
     void* native_create = solder_dlsym(target_handle, "createVkContext");
     const char* native_create_err = solder_dlerror();
