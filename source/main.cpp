@@ -2911,12 +2911,8 @@ void runtime_probe_leaf_module(std::string& result) {
         return static_cast<uintptr_t>(target64);
     };
 
-    uintptr_t native_create = solder_dlsym(
-        target_handle,
-        "createVkContext"
-    );
-    const char* native_create_err = solder_dlerror();
-
+    // V23 already resolved createVkContext above. Reuse that pointer here;
+    // do not perform a second dlsym or redeclare the same variables.
     if (!native_create) {
         char line2[512];
         std::snprintf(line2, sizeof(line2),
