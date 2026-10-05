@@ -111,26 +111,6 @@ static int g_main_export_count = 0;
 using PthreadCreateProbeFn = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 static PthreadCreateProbeFn g_vortek_probe_original_pthread_create = nullptr;
 static int g_vortek_probe_pthread_create_count = 0;
-static int gn_vortek_probe_pthread_detach(pthread_t) {
-    append_log("RUNTIME PROBE V35: pthread_detach suppressed");
-    return 0;
-}
-
-static int gn_vortek_probe_pthread_mutex_init(
-    pthread_mutex_t*,
-    const pthread_mutexattr_t*) {
-    append_log("RUNTIME PROBE V35: pthread_mutex_init suppressed");
-    return 0;
-}
-
-static int gn_vortek_probe_pthread_cond_init(
-    pthread_cond_t*,
-    const pthread_condattr_t*) {
-    append_log("RUNTIME PROBE V35: pthread_cond_init suppressed");
-    return 0;
-}
-
-
 static int gn_vortek_probe_pthread_create(
     pthread_t* thread,
     const pthread_attr_t*,
