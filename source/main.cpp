@@ -3016,7 +3016,7 @@ void runtime_probe_leaf_module(std::string& result) {
     uintptr_t call_targets[64]{};
     int call_count = 0;
 
-    for (int i = 0; i < 192; ++i) {
+    for (int i = 0; i < 320; ++i) {
         const uintptr_t pc = create_pc + static_cast<uintptr_t>(i * 4);
         uint32_t insn = 0;
         std::memcpy(&insn, reinterpret_cast<const void*>(pc), sizeof(insn));
@@ -3024,8 +3024,9 @@ void runtime_probe_leaf_module(std::string& result) {
         if (is_bl(insn)) {
             const uintptr_t dst = decode_bl(pc, insn);
             std::snprintf(line2, sizeof(line2),
-                          "RUNTIME PROBE V29: CREATE BL[%d] pc=%p -> %p",
-                          i, reinterpret_cast<void*>(pc), reinterpret_cast<void*>(dst));
+                          "RUNTIME PROBE V29: CREATE BL[%d] pc=%p -> %p%s",
+                          i, reinterpret_cast<void*>(pc), reinterpret_cast<void*>(dst),
+                          (dst > create_pc && dst < (create_pc + 0x10000)) ? " [INTERNAL]" : "");
             append_log(line2);
 
             bool seen = false;
