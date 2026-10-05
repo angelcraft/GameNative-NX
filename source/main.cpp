@@ -3447,267 +3447,215 @@ void runtime_probe_leaf_module(std::string& result) {
         return;
     }
 
-    append_log("RUNTIME PROBE V33: locate createVkContextForClient with real function boundaries");
+    append_log("RUNTIME PROBE V34: verify createVkContext inlining via ring/shim callsites");
 
-    // V32 proved the broad signature scan works, but its function ranges were
-    // over-extended until the next detected prologue. That created false
-    // positives because literal references from later functions were counted.
-    // V33 closes each function at its first AArch64 RET (or the next prologue).
-    // NO CALL in V33.
+    // The V33 bounded-function heuristic was fundamentally ambiguous because
+    // AArch64 functions may contain multiple RETs and our ring-string xrefs
+    // were backtracked to the wrong prologue. V34 does not invent function
+    // boundaries. Instead, it treats the already-resolved createVkContext
+    // symbol as the containing text range and looks for the exact compatibility
+    // shims that createVkContextForClient/setupRingBuffers would execute if
+    // those bodies were inlined into createVkContext.
+    //
+    // Analysis only: NO CALL, NO branch patching.
 
-    struct V33FunctionRange {
-        uintptr_t start = 0;
-        uintptr_t end = 0;
+    const uintptr_t v34_create = create_pc;
+    const uintptr_t v34_window_end =
+        std::min(v31_text_end, v34_create + static_cast<uintptr_t>(0x1000));
+
+    {
+        char msg[384];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V34: create window=%p..%p size=0x%llx",
+            reinterpret_cast<void*>(v34_create),
+            reinterpret_cast<void*>(v34_window_end),
+            static_cast<unsigned long long>(v34_window_end - v34_create));
+        append_log(msg);
+    }
+
+    auto log_literal_delta =
+        [&](const char* name, const std::vector<uintptr_t>& refs) {
+            for (uintptr_t ref_pc : refs) {
+                const bool inside =
+                    ref_pc >= v34_create && ref_pc < v34_window_end;
+
+                char msg[384];
+                std::snprintf(
+                    msg, sizeof(msg),
+                    "RUNTIME PROBE V34: literal %s ref=%p delta=%+lld insideCreateWindow=%d",
+                    name,
+                    reinterpret_cast<void*>(ref_pc),
+                    static_cast<long long>(
+                        static_cast<intptr_t>(ref_pc) -
+                        static_cast<intptr_t>(v34_create)),
+                    inside ? 1 : 0);
+                append_log(msg);
+            }
+        };
+
+    log_literal_delta("vt-server-ring", server_ring_strings);
+    log_literal_delta("vt-client-ring", client_ring_strings);
+
+    const uintptr_t v34_ashmem =
+        reinterpret_cast<uintptr_t>(&gn_vortek_probe_ashmemCreateRegion);
+    const uintptr_t v34_sendmsg =
+        reinterpret_cast<uintptr_t>(&gn_vortek_probe_sendmsg);
+    const uintptr_t v34_pthread_create =
+        reinterpret_cast<uintptr_t>(&gn_vortek_probe_pthread_create);
+
+    uintptr_t v34_calloc = 0;
+    uintptr_t v34_mutex_init = 0;
+
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (!g_main_exports[i].name)
+            continue;
+
+        const uintptr_t addr =
+            reinterpret_cast<uintptr_t>(g_main_exports[i].addr_rx);
+
+        if (std::strcmp(g_main_exports[i].name, "calloc") == 0)
+            v34_calloc = addr;
+
+        if (std::strcmp(g_main_exports[i].name, "pthread_mutex_init") == 0)
+            v34_mutex_init = addr;
+    }
+
+    struct V34Callsite {
+        uintptr_t pc = 0;
+        uintptr_t raw_target = 0;
+        uintptr_t resolved_target = 0;
+        const char* label = nullptr;
     };
 
-    std::vector<V33FunctionRange> function_ranges;
-    function_ranges.reserve(512);
+    std::vector<V34Callsite> callsites;
 
-    std::vector<uintptr_t> prologues;
-    prologues.reserve(512);
+    auto record_direct_call =
+        [&](uintptr_t pc, uint32_t word) {
+            if (!is_bl(word))
+                return;
 
-    for (uintptr_t pc = v31_text_begin;
-         pc + 4 <= v31_text_end;
+            const uintptr_t raw_target = decode_bl(pc, word);
+            const uintptr_t resolved_target =
+                follow_branch_chain(raw_target);
+
+            auto match = [&](uintptr_t target) {
+                return target != 0 && resolved_target == target;
+            };
+
+            const char* label = nullptr;
+
+            if (match(v34_ashmem))
+                label = "ashmemCreateRegion shim";
+            else if (match(v34_sendmsg))
+                label = "sendmsg shim";
+            else if (match(v34_pthread_create))
+                label = "pthread_create guard shim";
+            else if (v34_calloc && match(v34_calloc))
+                label = "calloc";
+            else if (v34_mutex_init && match(v34_mutex_init))
+                label = "pthread_mutex_init";
+
+            if (!label)
+                return;
+
+            callsites.push_back(
+                V34Callsite{pc, raw_target, resolved_target, label});
+        };
+
+    for (uintptr_t pc = v34_create;
+         pc + 4 <= v34_window_end;
          pc += 4) {
         uint32_t word = 0;
         std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
-        if (is_stp_fp_lr_preindex(word))
-            prologues.push_back(pc);
-    }
-
-    for (size_t i = 0; i < prologues.size(); ++i) {
-        const uintptr_t fn = prologues[i];
-        const uintptr_t next_prologue =
-            (i + 1 < prologues.size()) ? prologues[i + 1] : v31_text_end;
-        const uintptr_t scan_limit =
-            std::min(next_prologue, fn + static_cast<uintptr_t>(0x1000));
-
-        uintptr_t fn_end = scan_limit;
-
-        // Prefer the first real RET in the function body. This prevents
-        // a preceding helper's literals from leaking into the following
-        // function's signature analysis.
-        for (uintptr_t scan = fn + 4;
-             scan + 4 <= scan_limit;
-             scan += 4) {
-            uint32_t word = 0;
-            std::memcpy(&word, reinterpret_cast<const void*>(scan), sizeof(word));
-            if (word == 0xD65F03C0U) {
-                fn_end = scan + 4;
-                break;
-            }
-        }
-
-        if (fn_end > fn + 4)
-            function_ranges.push_back(V33FunctionRange{fn, fn_end});
+        record_direct_call(pc, word);
     }
 
     {
         char msg[256];
         std::snprintf(
             msg, sizeof(msg),
-            "RUNTIME PROBE V33: bounded functions=%zu prologues=%zu",
-            function_ranges.size(), prologues.size());
+            "RUNTIME PROBE V34: matching direct callsites=%zu",
+            callsites.size());
         append_log(msg);
     }
 
-    uintptr_t v33_calloc = 0;
-    uintptr_t v33_mutex_init = 0;
-
-    for (int i = 0; i < g_main_export_count; ++i) {
-        if (!g_main_exports[i].name)
-            continue;
-
-        if (std::strcmp(g_main_exports[i].name, "calloc") == 0)
-            v33_calloc = reinterpret_cast<uintptr_t>(g_main_exports[i].addr_rx);
-
-        if (std::strcmp(g_main_exports[i].name, "pthread_mutex_init") == 0)
-            v33_mutex_init = reinterpret_cast<uintptr_t>(g_main_exports[i].addr_rx);
-    }
-
-    auto function_has_literal_bounded =
-        [&](uintptr_t fn, uintptr_t fn_end, uintptr_t literal) -> bool {
-            if (!literal || fn_end <= fn)
-                return false;
-
-            for (uintptr_t pc = fn;
-                 pc + 8 <= fn_end;
-                 pc += 4) {
-                uint32_t w0 = 0;
-                uint32_t w1 = 0;
-                std::memcpy(&w0, reinterpret_cast<const void*>(pc), sizeof(w0));
-                std::memcpy(&w1, reinterpret_cast<const void*>(pc + 4), sizeof(w1));
-
-                if (!is_adrp(w0))
-                    continue;
-
-                const unsigned reg = w0 & 0x1FU;
-                if (((w1 >> 5) & 0x1FU) != reg || (w1 & 0x1FU) != reg)
-                    continue;
-
-                if ((w1 & 0xFF00001FU) != 0x91000000U)
-                    continue;
-
-                if (add_immediate_target(adrp_target(pc, w0), w1) == literal)
-                    return true;
-            }
-
-            return false;
-        };
-
-    struct V33Candidate {
-        uintptr_t start = 0;
-        uintptr_t end = 0;
-        int calloc_calls = 0;
-        int mutex_calls = 0;
-        bool has_server_literal = false;
-        bool has_client_literal = false;
-        bool has_setup_bl = false;
-        bool near_create = false;
-        int score = 0;
-    };
-
-    std::vector<V33Candidate> candidates;
-
-    for (const auto& fnrange : function_ranges) {
-        const uintptr_t fn = fnrange.start;
-        const uintptr_t body_end = fnrange.end;
-
-        int calloc_calls = 0;
-        int mutex_calls = 0;
-        bool has_setup_bl = false;
-
-        for (uintptr_t scan = fn;
-             scan + 4 <= body_end;
-             scan += 4) {
-            uint32_t sw = 0;
-            std::memcpy(&sw, reinterpret_cast<const void*>(scan), sizeof(sw));
-
-            if (sw == 0xD65F03C0U)
-                break;
-
-            if (!is_bl(sw))
-                continue;
-
-            const uintptr_t real = follow_branch_chain(decode_bl(scan, sw));
-
-            if (v33_calloc && real == v33_calloc)
-                ++calloc_calls;
-
-            if (v33_mutex_init && real == v33_mutex_init)
-                ++mutex_calls;
-
-            if (setup_candidate && real == setup_candidate)
-                has_setup_bl = true;
-        }
-
-        const bool has_server =
-            !server_ring_strings.empty() &&
-            function_has_literal_bounded(fn, body_end, server_ring_strings[0]);
-
-        const bool has_client =
-            !client_ring_strings.empty() &&
-            function_has_literal_bounded(fn, body_end, client_ring_strings[0]);
-
-        const bool near_create =
-            (fn < create_pc)
-                ? ((create_pc - fn) < static_cast<uintptr_t>(0x3000))
-                : ((fn - create_pc) < static_cast<uintptr_t>(0x1000));
-
-        int score = calloc_calls * 30 + mutex_calls * 100;
-        if (has_server)
-            score += 80;
-        if (has_client)
-            score += 80;
-        if (has_server && has_client)
-            score += 160;
-        if (has_setup_bl)
-            score += 200;
-        if (near_create)
-            score += 40;
-
-        if (calloc_calls || mutex_calls || has_server || has_client || has_setup_bl) {
-            candidates.push_back(V33Candidate{
-                fn, body_end, calloc_calls, mutex_calls,
-                has_server, has_client, has_setup_bl, near_create, score
-            });
-        }
-    }
-
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        for (size_t j = i + 1; j < candidates.size(); ++j) {
-            if (candidates[j].score > candidates[i].score) {
-                V33Candidate tmp = candidates[i];
-                candidates[i] = candidates[j];
-                candidates[j] = tmp;
-            }
-        }
-    }
-
-    const size_t dump_count = std::min<size_t>(16, candidates.size());
-
-    for (size_t i = 0; i < dump_count; ++i) {
-        const V33Candidate& candidate = candidates[i];
-
+    for (const auto& hit : callsites) {
         char msg[384];
         std::snprintf(
             msg, sizeof(msg),
-            "RUNTIME PROBE V33: CANDIDATE[%zu] fn=%p end=%p size=0x%llx calloc=%d mutex_init=%d server=%d client=%d setupBL=%d nearCreate=%d score=%d",
-            i,
-            reinterpret_cast<void*>(candidate.start),
-            reinterpret_cast<void*>(candidate.end),
-            static_cast<unsigned long long>(candidate.end - candidate.start),
-            candidate.calloc_calls,
-            candidate.mutex_calls,
-            candidate.has_server_literal ? 1 : 0,
-            candidate.has_client_literal ? 1 : 0,
-            candidate.has_setup_bl ? 1 : 0,
-            candidate.near_create ? 1 : 0,
-            candidate.score);
+            "RUNTIME PROBE V34: %s pc=%p delta=+0x%llx rawTarget=%p resolved=%p",
+            hit.label,
+            reinterpret_cast<void*>(hit.pc),
+            static_cast<unsigned long long>(hit.pc - v34_create),
+            reinterpret_cast<void*>(hit.raw_target),
+            reinterpret_cast<void*>(hit.resolved_target));
         append_log(msg);
 
-        for (int insn_index = 0; insn_index < 128; ++insn_index) {
-            const uintptr_t pc =
-                candidate.start + static_cast<uintptr_t>(insn_index * 4);
-            if (pc >= candidate.end || pc >= v31_text_end)
-                break;
+        const uintptr_t dump_begin =
+            (hit.pc >= v34_create + 5 * 4)
+                ? hit.pc - 5 * 4
+                : v34_create;
 
+        const uintptr_t dump_end =
+            std::min(v34_window_end, hit.pc + 6 * 4);
+
+        int index = 0;
+        for (uintptr_t insn_pc = dump_begin;
+             insn_pc < dump_end;
+             insn_pc += 4, ++index) {
             uint32_t word = 0;
-            std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
+            std::memcpy(
+                &word,
+                reinterpret_cast<const void*>(insn_pc),
+                sizeof(word));
 
             char insn_line[256];
             std::snprintf(
                 insn_line, sizeof(insn_line),
-                "RUNTIME PROBE V33: CANDIDATE[%zu] insn[%03d] pc=%p word=0x%08x",
-                i, insn_index, reinterpret_cast<void*>(pc), word);
+                "RUNTIME PROBE V34: callsite-context[%d] pc=%p word=0x%08x",
+                index,
+                reinterpret_cast<void*>(insn_pc),
+                word);
             append_log(insn_line);
-
-            if (word == 0xD65F03C0U)
-                break;
         }
     }
 
-    if (!candidates.empty()) {
-        const auto& top = candidates[0];
+    // The ring string references are the strongest marker. If both occur
+    // inside the same createVkContext window and the inlined body also
+    // contains our ashmem/pthread shims, createVkContextForClient/setupRingBuffers
+    // are almost certainly inlined rather than recoverable as a standalone
+    // callable function.
+    const bool both_literals_inside =
+        !server_ring_strings.empty() &&
+        !client_ring_strings.empty() &&
+        server_ring_strings[0] >= v34_create &&
+        client_ring_strings[0] >= v34_create &&
+        server_ring_strings[0] < v34_window_end &&
+        client_ring_strings[0] < v34_window_end;
 
-        char msg[384];
-        std::snprintf(
-            msg, sizeof(msg),
-            "RUNTIME PROBE V33: TOP fn=%p end=%p size=0x%llx score=%d calloc=%d mutex_init=%d server=%d client=%d setupBL=%d nearCreate=%d",
-            reinterpret_cast<void*>(top.start),
-            reinterpret_cast<void*>(top.end),
-            static_cast<unsigned long long>(top.end - top.start),
-            top.score,
-            top.calloc_calls,
-            top.mutex_calls,
-            top.has_server_literal ? 1 : 0,
-            top.has_client_literal ? 1 : 0,
-            top.has_setup_bl ? 1 : 0,
-            top.near_create ? 1 : 0);
-        append_log(msg);
-    } else {
-        append_log("RUNTIME PROBE V33: no candidates matched");
+    bool has_ashmem = false;
+    bool has_pthread_guard = false;
+
+    for (const auto& hit : callsites) {
+        if (std::strcmp(hit.label, "ashmemCreateRegion shim") == 0)
+            has_ashmem = true;
+        if (std::strcmp(hit.label, "pthread_create guard shim") == 0)
+            has_pthread_guard = true;
     }
+
+    char summary[384];
+    std::snprintf(
+        summary, sizeof(summary),
+        "RUNTIME PROBE V34: inlining evidence literalsBothInside=%d ashmemShim=%d pthreadCreateShim=%d",
+        both_literals_inside ? 1 : 0,
+        has_ashmem ? 1 : 0,
+        has_pthread_guard ? 1 : 0);
+    append_log(summary);
+
+    append_log("RUNTIME PROBE V34: refusing execution; callsite analysis only");
+    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+    return;
 
     append_log("RUNTIME PROBE V33: refusing execution; candidate analysis only");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
