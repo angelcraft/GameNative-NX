@@ -3085,6 +3085,8 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
+}
+
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
