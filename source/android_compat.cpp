@@ -461,23 +461,100 @@ extern "C" struct cmsghdr* gn_android_cmsg_nxthdr(
 // kernel-perfect Linux eventfd implementation.
 //
 
+// Vortek's RingBuffer uses mmap(MAP_SHARED) only as backing storage for
+// producer/consumer state. In the current GameNative-NX architecture both
+// endpoints are inside the same Horizon process, so an aligned heap allocation
+// is sufficient and avoids requiring a Linux mmap syscall.
+struct GnCompatMapping {
+    void* base = nullptr;
+    size_t size = 0;
+};
+
+constexpr size_t kMaxGnCompatMappings = 128;
+static GnCompatMapping g_gn_compat_mappings[kMaxGnCompatMappings];
+static pthread_mutex_t g_gn_compat_mmap_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t gn_align_page(size_t n) {
+    constexpr size_t page = 0x1000;
+    if (n > SIZE_MAX - (page - 1))
+        return 0;
+    return (n + page - 1) & ~(page - 1);
+}
+
 extern "C" void* gn_android_mmap(
     void* /*addr*/,
-    size_t /*length*/,
+    size_t length,
     int /*prot*/,
     int /*flags*/,
     int /*fd*/,
-    int64_t /*offset*/
+    int64_t offset
 ) {
-    errno = ENOSYS;
+    if (length == 0 || offset < 0 || static_cast<uint64_t>(offset) > SIZE_MAX - length) {
+        errno = EINVAL;
+        return reinterpret_cast<void*>(-1);
+    }
+
+    const size_t total = gn_align_page(length + static_cast<size_t>(offset));
+    if (total == 0) {
+        errno = EOVERFLOW;
+        return reinterpret_cast<void*>(-1);
+    }
+
+    void* memory = nullptr;
+    const int rc = ::posix_memalign(&memory, 0x1000, total);
+    if (rc != 0 || !memory) {
+        errno = ENOMEM;
+        return reinterpret_cast<void*>(-1);
+    }
+
+    std::memset(memory, 0, total);
+
+    pthread_mutex_lock(&g_gn_compat_mmap_mutex);
+    for (size_t i = 0; i < kMaxGnCompatMappings; ++i) {
+        if (!g_gn_compat_mappings[i].base) {
+            g_gn_compat_mappings[i].base = memory;
+            g_gn_compat_mappings[i].size = total;
+            pthread_mutex_unlock(&g_gn_compat_mmap_mutex);
+            return static_cast<uint8_t*>(memory) + static_cast<size_t>(offset);
+        }
+    }
+    pthread_mutex_unlock(&g_gn_compat_mmap_mutex);
+
+    ::free(memory);
+    errno = ENOMEM;
     return reinterpret_cast<void*>(-1);
 }
 
 extern "C" int gn_android_munmap(
-    void* /*addr*/,
-    size_t /*length*/
+    void* addr,
+    size_t length
 ) {
-    errno = ENOSYS;
+    (void)length;
+    if (!addr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_gn_compat_mmap_mutex);
+    for (size_t i = 0; i < kMaxGnCompatMappings; ++i) {
+        GnCompatMapping& mapping = g_gn_compat_mappings[i];
+        if (!mapping.base)
+            continue;
+
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(mapping.base);
+        const uintptr_t end = begin + mapping.size;
+        const uintptr_t p = reinterpret_cast<uintptr_t>(addr);
+
+        if (p >= begin && p < end) {
+            ::free(mapping.base);
+            mapping = {};
+            pthread_mutex_unlock(&g_gn_compat_mmap_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_gn_compat_mmap_mutex);
+
+    errno = EINVAL;
     return -1;
 }
 
