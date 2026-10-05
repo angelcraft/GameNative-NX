@@ -3714,6 +3714,7 @@ void runtime_probe_leaf_module(std::string& result) {
     return;
 
 
+} // runtime_probe_leaf_module
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
