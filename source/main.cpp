@@ -3082,23 +3082,19 @@ void runtime_probe_leaf_module(std::string& result) {
             dump_window("CALL TARGET", real, 48);
     }
 
-    append_log("RUNTIME PROBE V30: parse ELF local symbols and execute exact createVkContextForClient probe");
+    append_log("RUNTIME PROBE V31: locate createVkContextForClient via setupRingBuffers references");
 
-    struct LocalSymbolHit {
-        uintptr_t value = 0;
-        bool found = false;
+    struct ElfTextProbeSections {
+        Elf64_Shdr text{};
+        bool have_text = false;
+        std::vector<Elf64_Shdr> alloc_nonexec;
     };
 
-    auto lookup_local_symbol_elf = [&](const char* path, const char* wanted,
-                                       uintptr_t known_runtime, uintptr_t known_dyn_value,
-                                       uintptr_t& out_bias) -> LocalSymbolHit {
-        LocalSymbolHit hit{};
-        out_bias = 0;
-
+    auto load_probe_sections = [&](const char* path, ElfTextProbeSections& out) -> bool {
         FILE* fp = std::fopen(path, "rb");
         if (!fp) {
-            append_log("RUNTIME PROBE V30: fopen ELF FAILED");
-            return hit;
+            append_log("RUNTIME PROBE V31: fopen ELF FAILED");
+            return false;
         }
 
         Elf64_Ehdr eh{};
@@ -3107,83 +3103,145 @@ void runtime_probe_leaf_module(std::string& result) {
             eh.e_ident[EI_MAG1] != ELFMAG1 ||
             eh.e_ident[EI_MAG2] != ELFMAG2 ||
             eh.e_ident[EI_MAG3] != ELFMAG3 ||
-            eh.e_ident[EI_CLASS] != ELFCLASS64) {
-            append_log("RUNTIME PROBE V30: invalid 64-bit ELF");
+            eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+            eh.e_shentsize != sizeof(Elf64_Shdr) ||
+            eh.e_shoff == 0 ||
+            eh.e_shnum == 0) {
+            append_log("RUNTIME PROBE V31: invalid ELF section table");
             std::fclose(fp);
-            return hit;
+            return false;
         }
 
         std::vector<Elf64_Shdr> shdrs(eh.e_shnum);
-        if (eh.e_shoff == 0 || eh.e_shentsize != sizeof(Elf64_Shdr) ||
-            std::fseek(fp, static_cast<long>(eh.e_shoff), SEEK_SET) != 0 ||
+        if (std::fseek(fp, static_cast<long>(eh.e_shoff), SEEK_SET) != 0 ||
             std::fread(shdrs.data(), sizeof(Elf64_Shdr), shdrs.size(), fp) != shdrs.size()) {
-            append_log("RUNTIME PROBE V30: ELF section table read FAILED");
+            append_log("RUNTIME PROBE V31: section table read FAILED");
             std::fclose(fp);
-            return hit;
+            return false;
         }
 
-        for (size_t si = 0; si < shdrs.size(); ++si) {
-            const Elf64_Shdr& symsec = shdrs[si];
-            if (symsec.sh_type != SHT_SYMTAB && symsec.sh_type != SHT_DYNSYM)
-                continue;
-            if (symsec.sh_link >= shdrs.size())
+        for (const auto& sh : shdrs) {
+            if (sh.sh_type != SHT_PROGBITS)
                 continue;
 
-            const Elf64_Shdr& strsec = shdrs[symsec.sh_link];
-            std::vector<char> strtab(strsec.sh_size);
-            if (std::fseek(fp, static_cast<long>(strsec.sh_offset), SEEK_SET) != 0 ||
-                std::fread(strtab.data(), 1, strtab.size(), fp) != strtab.size())
-                continue;
-
-            const size_t sym_count = symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
-            if (sym_count == 0)
-                continue;
-
-            if (std::fseek(fp, static_cast<long>(symsec.sh_offset), SEEK_SET) != 0)
-                continue;
-
-            for (size_t i = 0; i < sym_count; ++i) {
-                Elf64_Sym sym{};
-                if (std::fread(&sym, 1, sizeof(sym), fp) != sizeof(sym))
-                    break;
-                if (sym.st_name >= strtab.size())
-                    continue;
-
-                const char* name = strtab.data() + sym.st_name;
-                if (std::strcmp(name, wanted) == 0 && sym.st_value != 0) {
-                    char msg[256];
-                    std::snprintf(msg, sizeof(msg),
-                                  "RUNTIME PROBE V30: ELF symbol %s value=0x%llx section=%zu type=%u bind=%u",
-                                  wanted,
-                                  static_cast<unsigned long long>(sym.st_value),
-                                  static_cast<size_t>(sym.st_shndx),
-                                  static_cast<unsigned>(ELF64_ST_TYPE(sym.st_info)),
-                                  static_cast<unsigned>(ELF64_ST_BIND(sym.st_info)));
-                    append_log(msg);
-
-                    if (symsec.sh_type == SHT_DYNSYM && known_runtime && known_dyn_value) {
-                        out_bias = known_runtime - known_dyn_value;
-                    }
-
-                    if (symsec.sh_type == SHT_SYMTAB || hit.value == 0) {
-                        hit.value = sym.st_value;
-                        hit.found = true;
-                    }
+            if ((sh.sh_flags & SHF_EXECINSTR) != 0 && sh.sh_size > 0) {
+                if (!out.have_text || sh.sh_size > out.text.sh_size) {
+                    out.text = sh;
+                    out.have_text = true;
                 }
+            } else if ((sh.sh_flags & SHF_ALLOC) != 0 && sh.sh_size > 0) {
+                out.alloc_nonexec.push_back(sh);
             }
         }
 
         std::fclose(fp);
-        return hit;
+        return out.have_text;
     };
 
-    const std::string vortek_path = std::string(kNativeDir) + "/libvortekrenderer.so";
-    uintptr_t load_bias = 0;
+    auto find_literal_runtime_addresses =
+        [&](const char* path,
+            const ElfTextProbeSections& secs,
+            const char* literal,
+            std::vector<uintptr_t>& out_addrs,
+            uintptr_t bias) -> bool {
+        out_addrs.clear();
 
-    // Derive ELF load bias from the exported createVkContext dynamic symbol.
-    uintptr_t dyn_value = 0;
+        FILE* fp = std::fopen(path, "rb");
+        if (!fp)
+            return false;
+
+        const size_t literal_len = std::strlen(literal);
+        if (literal_len == 0) {
+            std::fclose(fp);
+            return false;
+        }
+
+        for (const auto& sh : secs.alloc_nonexec) {
+            if (sh.sh_size < literal_len + 1)
+                continue;
+
+            std::vector<unsigned char> data(sh.sh_size);
+            if (std::fseek(fp, static_cast<long>(sh.sh_offset), SEEK_SET) != 0 ||
+                std::fread(data.data(), 1, data.size(), fp) != data.size()) {
+                continue;
+            }
+
+            for (size_t i = 0; i + literal_len + 1 <= data.size(); ++i) {
+                if (std::memcmp(data.data() + i, literal, literal_len) != 0)
+                    continue;
+                if (data[i + literal_len] != '\0')
+                    continue;
+
+                out_addrs.push_back(
+                    bias + sh.sh_addr + static_cast<uintptr_t>(i));
+            }
+        }
+
+        std::fclose(fp);
+        return !out_addrs.empty();
+    };
+
+    auto is_adrp = [](uint32_t word) -> bool {
+        return (word & 0x9F000000U) == 0x90000000U;
+    };
+
+    auto adrp_target = [](uintptr_t pc, uint32_t word) -> uintptr_t {
+        const uint32_t immlo = (word >> 29) & 0x3U;
+        const uint32_t immhi = (word >> 5) & 0x7FFFFU;
+        int64_t imm21 = static_cast<int64_t>((immhi << 2) | immlo);
+        if (imm21 & (1LL << 20))
+            imm21 -= (1LL << 21);
+
+        const uintptr_t page = pc & ~static_cast<uintptr_t>(0xFFFU);
+        return static_cast<uintptr_t>(
+            static_cast<intptr_t>(page) + (imm21 << 12));
+    };
+
+    auto add_immediate_target = [](uintptr_t adrp_value, uint32_t add_word) -> uintptr_t {
+        const uintptr_t src = (add_word >> 5) & 0x1FU;
+        const uintptr_t dst = add_word & 0x1FU;
+        const uintptr_t sh = (add_word >> 22) & 0x1U;
+        if (src != dst)
+            return 0;
+
+        const uintptr_t imm12 = (add_word >> 10) & 0xFFFU;
+        return adrp_value + (imm12 << (sh ? 12 : 0));
+    };
+
+    auto is_stp_fp_lr_preindex = [](uint32_t word) -> bool {
+        return (word & 0xFFC07FFFU) == 0xA9807BFDu;
+    };
+
+    auto backtrack_prologue = [&](uintptr_t pc, uintptr_t text_begin) -> uintptr_t {
+        const uintptr_t floor = (pc > 0x800) ? pc - 0x800 : text_begin;
+        uintptr_t cur = pc & ~static_cast<uintptr_t>(0x3U);
+
+        while (cur >= text_begin + 4 && cur >= floor) {
+            cur -= 4;
+            uint32_t word = 0;
+            std::memcpy(&word, reinterpret_cast<const void*>(cur), sizeof(word));
+            if (is_stp_fp_lr_preindex(word))
+                return cur;
+        }
+
+        return 0;
+    };
+
+    const std::string v31_vortek_path =
+        std::string(kNativeDir) + "/libvortekrenderer.so";
+
+    ElfTextProbeSections v31_secs{};
+    if (!load_probe_sections(v31_vortek_path.c_str(), v31_secs)) {
+        append_log("RUNTIME PROBE V31: could not identify executable ELF section");
+        append_log("RUNTIME PROBE V31: refusing execution");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    // Derive load bias again from the already-resolved exported symbol.
+    uintptr_t v31_dyn_value = 0;
     {
-        FILE* fp = std::fopen(vortek_path.c_str(), "rb");
+        FILE* fp = std::fopen(v31_vortek_path.c_str(), "rb");
         if (fp) {
             Elf64_Ehdr eh{};
             if (std::fread(&eh, 1, sizeof(eh), fp) == sizeof(eh) &&
@@ -3194,21 +3252,27 @@ void runtime_probe_leaf_module(std::string& result) {
                     for (const auto& symsec : shdrs) {
                         if (symsec.sh_type != SHT_DYNSYM || symsec.sh_link >= shdrs.size())
                             continue;
+
                         const auto& strsec = shdrs[symsec.sh_link];
                         std::vector<char> strtab(strsec.sh_size);
                         if (std::fseek(fp, static_cast<long>(strsec.sh_offset), SEEK_SET) != 0 ||
                             std::fread(strtab.data(), 1, strtab.size(), fp) != strtab.size())
                             continue;
+
                         if (std::fseek(fp, static_cast<long>(symsec.sh_offset), SEEK_SET) != 0)
                             continue;
-                        const size_t count = symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
+
+                        const size_t count =
+                            symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
+
                         for (size_t i = 0; i < count; ++i) {
                             Elf64_Sym sym{};
                             if (std::fread(&sym, 1, sizeof(sym), fp) != sizeof(sym))
                                 break;
+
                             if (sym.st_name < strtab.size() &&
                                 std::strcmp(strtab.data() + sym.st_name, "createVkContext") == 0) {
-                                dyn_value = sym.st_value;
+                                v31_dyn_value = sym.st_value;
                                 break;
                             }
                         }
@@ -3219,87 +3283,353 @@ void runtime_probe_leaf_module(std::string& result) {
         }
     }
 
-    if (dyn_value && native_create) {
-        load_bias = reinterpret_cast<uintptr_t>(native_create) - dyn_value;
-        char bias_line[256];
-        std::snprintf(bias_line, sizeof(bias_line),
-                      "RUNTIME PROBE V30: createVkContext dyn_value=0x%llx runtime=%p load_bias=0x%llx",
-                      static_cast<unsigned long long>(dyn_value),
-                      native_create,
-                      static_cast<unsigned long long>(load_bias));
-        append_log(bias_line);
-    } else {
-        append_log("RUNTIME PROBE V30: could not derive ELF load bias");
-    }
-
-    uintptr_t local_value = 0;
-    {
-        FILE* fp = std::fopen(vortek_path.c_str(), "rb");
-        bool found = false;
-        if (fp) {
-            Elf64_Ehdr eh{};
-            if (std::fread(&eh, 1, sizeof(eh), fp) == sizeof(eh) &&
-                eh.e_shoff && eh.e_shentsize == sizeof(Elf64_Shdr)) {
-                std::vector<Elf64_Shdr> shdrs(eh.e_shnum);
-                if (std::fseek(fp, static_cast<long>(eh.e_shoff), SEEK_SET) == 0 &&
-                    std::fread(shdrs.data(), sizeof(Elf64_Shdr), shdrs.size(), fp) == shdrs.size()) {
-                    for (const auto& symsec : shdrs) {
-                        if (symsec.sh_type != SHT_SYMTAB || symsec.sh_link >= shdrs.size())
-                            continue;
-                        const auto& strsec = shdrs[symsec.sh_link];
-                        std::vector<char> strtab(strsec.sh_size);
-                        if (std::fseek(fp, static_cast<long>(strsec.sh_offset), SEEK_SET) != 0 ||
-                            std::fread(strtab.data(), 1, strtab.size(), fp) != strtab.size())
-                            continue;
-                        if (std::fseek(fp, static_cast<long>(symsec.sh_offset), SEEK_SET) != 0)
-                            continue;
-                        const size_t count = symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
-                        for (size_t i = 0; i < count; ++i) {
-                            Elf64_Sym sym{};
-                            if (std::fread(&sym, 1, sizeof(sym), fp) != sizeof(sym))
-                                break;
-                            if (sym.st_name < strtab.size() &&
-                                std::strcmp(strtab.data() + sym.st_name, "createVkContextForClient") == 0) {
-                                local_value = sym.st_value;
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            std::fclose(fp);
-        }
-        if (!found)
-            append_log("RUNTIME PROBE V30: createVkContextForClient NOT PRESENT in .symtab");
-    }
-
-    if (!local_value || !load_bias) {
-        append_log("RUNTIME PROBE V30: exact local symbol unavailable; refusing execution");
+    if (!v31_dyn_value || !native_create) {
+        append_log("RUNTIME PROBE V31: cannot derive load bias");
+        append_log("RUNTIME PROBE V31: refusing execution");
         append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
         return;
     }
 
-    const uintptr_t exact_target = load_bias + local_value;
+    const uintptr_t v31_bias =
+        reinterpret_cast<uintptr_t>(native_create) - v31_dyn_value;
+    const uintptr_t v31_text_begin =
+        v31_bias + v31_secs.text.sh_addr;
+    const uintptr_t v31_text_end =
+        v31_text_begin + v31_secs.text.sh_size;
+
     {
-        char addr_line[256];
-        std::snprintf(addr_line, sizeof(addr_line),
-                      "RUNTIME PROBE V30: createVkContextForClient exact runtime=%p (st_value=0x%llx)",
-                      reinterpret_cast<void*>(exact_target),
-                      static_cast<unsigned long long>(local_value));
-        append_log(addr_line);
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V31: text runtime=%p..%p bias=0x%llx",
+            reinterpret_cast<void*>(v31_text_begin),
+            reinterpret_cast<void*>(v31_text_end),
+            static_cast<unsigned long long>(v31_bias));
+        append_log(msg);
     }
 
-    append_log("RUNTIME PROBE V30: exact local symbol found; dumping prologue before execution");
-    for (int i = 0; i < 32; ++i) {
-        const uintptr_t pc = exact_target + static_cast<uintptr_t>(i * 4);
+    std::vector<uintptr_t> server_ring_strings;
+    std::vector<uintptr_t> client_ring_strings;
+
+    find_literal_runtime_addresses(
+        v31_vortek_path.c_str(),
+        v31_secs,
+        "vt-server-ring",
+        server_ring_strings,
+        v31_bias);
+
+    find_literal_runtime_addresses(
+        v31_vortek_path.c_str(),
+        v31_secs,
+        "vt-client-ring",
+        client_ring_strings,
+        v31_bias);
+
+    {
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V31: literal refs server=%zu client=%zu",
+            server_ring_strings.size(),
+            client_ring_strings.size());
+        append_log(msg);
+    }
+
+    struct FunctionHit {
+        uintptr_t start = 0;
+        uintptr_t ref_pc = 0;
+        uintptr_t literal = 0;
+        bool server = false;
+    };
+
+    std::vector<FunctionHit> literal_functions;
+
+    auto record_literal_functions =
+        [&](uintptr_t literal, bool is_server) {
+            for (uintptr_t text_pc = v31_text_begin;
+                 text_pc + 8 <= v31_text_end;
+                 text_pc += 4) {
+                uint32_t w0 = 0;
+                uint32_t w1 = 0;
+                std::memcpy(&w0, reinterpret_cast<const void*>(text_pc), sizeof(w0));
+                std::memcpy(&w1, reinterpret_cast<const void*>(text_pc + 4), sizeof(w1));
+
+                if (!is_adrp(w0))
+                    continue;
+
+                const unsigned reg = w0 & 0x1FU;
+                if (((w1 >> 5) & 0x1FU) != reg || (w1 & 0x1FU) != reg)
+                    continue;
+
+                const bool is_add_imm =
+                    (w1 & 0xFF00001FU) == 0x91000000U;
+                if (!is_add_imm)
+                    continue;
+
+                const uintptr_t base_page = adrp_target(text_pc, w0);
+                const uintptr_t target = add_immediate_target(base_page, w1);
+
+                if (target != literal)
+                    continue;
+
+                const uintptr_t function_start =
+                    backtrack_prologue(text_pc, v31_text_begin);
+
+                if (!function_start)
+                    continue;
+
+                bool duplicate = false;
+                for (const auto& hit : literal_functions) {
+                    if (hit.start == function_start &&
+                        hit.literal == literal &&
+                        hit.server == is_server) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+
+                if (!duplicate) {
+                    literal_functions.push_back(
+                        FunctionHit{function_start, text_pc, literal, is_server});
+
+                    char msg[256];
+                    std::snprintf(
+                        msg, sizeof(msg),
+                        "RUNTIME PROBE V31: literal %s ref pc=%p -> function=%p",
+                        is_server ? "vt-server-ring" : "vt-client-ring",
+                        reinterpret_cast<void*>(text_pc),
+                        reinterpret_cast<void*>(function_start));
+                    append_log(msg);
+                }
+            }
+        };
+
+    for (uintptr_t literal : server_ring_strings)
+        record_literal_functions(literal, true);
+
+    for (uintptr_t literal : client_ring_strings)
+        record_literal_functions(literal, false);
+
+    // Candidate setupRingBuffers functions should reference both strings.
+    uintptr_t setup_candidate = 0;
+
+    for (const auto& hit : literal_functions) {
+        bool has_server = false;
+        bool has_client = false;
+
+        for (const auto& other : literal_functions) {
+            if (other.start != hit.start)
+                continue;
+
+            if (other.server)
+                has_server = true;
+            else
+                has_client = true;
+        }
+
+        if (has_server && has_client) {
+            setup_candidate = hit.start;
+
+            char msg[256];
+            std::snprintf(
+                msg, sizeof(msg),
+                "RUNTIME PROBE V31: setupRingBuffers candidate=%p (references both ring names)",
+                reinterpret_cast<void*>(setup_candidate));
+            append_log(msg);
+            break;
+        }
+    }
+
+    if (!setup_candidate) {
+        append_log("RUNTIME PROBE V31: no function references both ring-buffer strings");
+        append_log("RUNTIME PROBE V31: refusing execution");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    // First try to find a direct caller. This handles the normal non-inlined
+    // static setupRingBuffers case.
+    struct CallerHit {
+        uintptr_t callsite = 0;
+        uintptr_t function_start = 0;
+        int calloc_calls = 0;
+        int mutex_init_calls = 0;
+    };
+
+    uintptr_t main_calloc = 0;
+    uintptr_t main_mutex_init = 0;
+
+    for (int i = 0; i < g_main_export_count; ++i) {
+        if (!g_main_exports[i].name)
+            continue;
+
+        if (std::strcmp(g_main_exports[i].name, "calloc") == 0)
+            main_calloc = reinterpret_cast<uintptr_t>(g_main_exports[i].addr_rx);
+
+        if (std::strcmp(g_main_exports[i].name, "pthread_mutex_init") == 0)
+            main_mutex_init = reinterpret_cast<uintptr_t>(g_main_exports[i].addr_rx);
+    }
+
+    std::vector<CallerHit> callers;
+
+    for (uintptr_t pc = v31_text_begin;
+         pc + 4 <= v31_text_end;
+         pc += 4) {
         uint32_t word = 0;
         std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
-        char insn_line[256];
-        std::snprintf(insn_line, sizeof(insn_line),
-                      "RUNTIME PROBE V30: EXACT insn[%02d] pc=%p word=0x%08x",
-                      i, reinterpret_cast<void*>(pc), word);
-        append_log(insn_line);
+
+        if (!is_bl(word))
+            continue;
+
+        const uintptr_t dst = decode_bl(pc, word);
+        if (dst != setup_candidate)
+            continue;
+
+        const uintptr_t caller = backtrack_prologue(pc, v31_text_begin);
+        if (!caller)
+            continue;
+
+        int calloc_calls = 0;
+        int mutex_calls = 0;
+
+        for (uintptr_t scan = caller;
+             scan + 4 <= v31_text_end && scan < caller + 0x600;
+             scan += 4) {
+            uint32_t sw = 0;
+            std::memcpy(&sw, reinterpret_cast<const void*>(scan), sizeof(sw));
+
+            if (sw == 0xD65F03C0U)
+                break;
+
+            if (!is_bl(sw))
+                continue;
+
+            const uintptr_t real = follow_branch_chain(decode_bl(scan, sw));
+            if (main_calloc && real == main_calloc)
+                ++calloc_calls;
+            if (main_mutex_init && real == main_mutex_init)
+                ++mutex_calls;
+        }
+
+        callers.push_back(CallerHit{pc, caller, calloc_calls, mutex_calls});
+
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V31: setup caller callsite=%p function=%p calloc_calls=%d mutex_init_calls=%d",
+            reinterpret_cast<void*>(pc),
+            reinterpret_cast<void*>(caller),
+            calloc_calls,
+            mutex_calls);
+        append_log(msg);
+    }
+
+    uintptr_t exact_target = 0;
+    int best_score = -1;
+
+    for (const auto& caller : callers) {
+        int score = caller.calloc_calls * 10 + caller.mutex_init_calls * 20;
+        if (score > best_score) {
+            best_score = score;
+            exact_target = caller.function_start;
+        }
+    }
+
+    // If setupRingBuffers was inlined, its caller does not exist. Look for a
+    // function containing both literals that also has the expected
+    // createVkContextForClient allocation pattern.
+    if (!exact_target) {
+        for (const auto& hit : literal_functions) {
+            if (!hit.start)
+                continue;
+
+            bool has_server = false;
+            bool has_client = false;
+            for (const auto& other : literal_functions) {
+                if (other.start != hit.start)
+                    continue;
+                has_server |= other.server;
+                has_client |= !other.server;
+            }
+
+            if (!has_server || !has_client)
+                continue;
+
+            int calloc_calls = 0;
+            int mutex_calls = 0;
+
+            for (uintptr_t scan = hit.start;
+                 scan + 4 <= v31_text_end && scan < hit.start + 0x700;
+                 scan += 4) {
+                uint32_t sw = 0;
+                std::memcpy(&sw, reinterpret_cast<const void*>(scan), sizeof(sw));
+
+                if (sw == 0xD65F03C0U)
+                    break;
+                if (!is_bl(sw))
+                    continue;
+
+                const uintptr_t real = follow_branch_chain(decode_bl(scan, sw));
+                if (main_calloc && real == main_calloc)
+                    ++calloc_calls;
+                if (main_mutex_init && real == main_mutex_init)
+                    ++mutex_calls;
+            }
+
+            const int score = calloc_calls * 10 + mutex_calls * 20;
+            char msg[256];
+            std::snprintf(
+                msg, sizeof(msg),
+                "RUNTIME PROBE V31: inlined candidate=%p calloc_calls=%d mutex_init_calls=%d score=%d",
+                reinterpret_cast<void*>(hit.start),
+                calloc_calls,
+                mutex_calls,
+                score);
+            append_log(msg);
+
+            if (score > best_score) {
+                best_score = score;
+                exact_target = hit.start;
+            }
+        }
+    }
+
+    if (!exact_target || best_score < 20) {
+        append_log("RUNTIME PROBE V31: createVkContextForClient candidate not confidently identified");
+        append_log("RUNTIME PROBE V31: refusing execution");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    {
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V31: EXACT createVkContextForClient candidate=%p score=%d",
+            reinterpret_cast<void*>(exact_target),
+            best_score);
+        append_log(msg);
+    }
+
+    // Dump the start before executing; the expected function has:
+    //   calloc(context), option copies, optional ArrayList_fromStrings,
+    //   pthread_mutex_init, calloc(memory pool), ThreadPool_init(8),
+    //   setupRingBuffers(context).
+    for (int i = 0; i < 96; ++i) {
+        const uintptr_t pc = exact_target + static_cast<uintptr_t>(i * 4);
+        if (pc >= v31_text_end)
+            break;
+
+        uint32_t word = 0;
+        std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
+
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V31: EXACT insn[%02d] pc=%p word=0x%08x",
+            i, reinterpret_cast<void*>(pc), word);
+        append_log(msg);
+
         if (word == 0xD65F03C0U)
             break;
     }
@@ -3323,7 +3653,8 @@ void runtime_probe_leaf_module(std::string& result) {
     using CreateVkContextForClientFn =
         void* (*)(int, const VortekContextOptionsProbe*, const void*);
 
-    append_log("RUNTIME PROBE V30: calling exact createVkContextForClient with synthetic fd=-1 and NULL JMethods");
+    append_log(
+        "RUNTIME PROBE V31: calling exact candidate with synthetic fd=-1 and NULL JMethods");
     const auto exact_create =
         reinterpret_cast<CreateVkContextForClientFn>(exact_target);
 
@@ -3331,12 +3662,13 @@ void runtime_probe_leaf_module(std::string& result) {
 
     const int saved_errno = errno;
     char result_line[256];
-    std::snprintf(result_line, sizeof(result_line),
-                  "RUNTIME PROBE V30: exact createVkContextForClient RETURNED context=%p errno=%d",
-                  context, saved_errno);
+    std::snprintf(
+        result_line, sizeof(result_line),
+        "RUNTIME PROBE V31: exact candidate RETURNED context=%p errno=%d",
+        context, saved_errno);
     append_log(result_line);
 
-    append_log("RUNTIME PROBE V30: exact local-symbol execution complete");
+    append_log("RUNTIME PROBE V31: exact createVkContextForClient execution complete");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
