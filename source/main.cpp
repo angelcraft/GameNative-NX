@@ -111,6 +111,25 @@ static int g_main_export_count = 0;
 using PthreadCreateProbeFn = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 static PthreadCreateProbeFn g_vortek_probe_original_pthread_create = nullptr;
 static int g_vortek_probe_pthread_create_count = 0;
+static int gn_vortek_probe_pthread_detach(pthread_t) {
+    append_log("RUNTIME PROBE V35: pthread_detach suppressed");
+    return 0;
+}
+
+static int gn_vortek_probe_pthread_mutex_init(
+    pthread_mutex_t*,
+    const pthread_mutexattr_t*) {
+    append_log("RUNTIME PROBE V35: pthread_mutex_init suppressed");
+    return 0;
+}
+
+static int gn_vortek_probe_pthread_cond_init(
+    pthread_cond_t*,
+    const pthread_condattr_t*) {
+    append_log("RUNTIME PROBE V35: pthread_cond_init suppressed");
+    return 0;
+}
+
 
 static int gn_vortek_probe_pthread_create(
     pthread_t* thread,
@@ -2746,6 +2765,30 @@ void runtime_probe_leaf_module(std::string& result) {
         append_log("RUNTIME PROBE V21: failed to install pthread_create guard");
         return;
     }
+
+    // V35: install the bootstrap-only pthread/mmap shims BEFORE
+    // solder_dlsym() triggers/uses the target's lazy relocations.
+    replace_main_export_addr(
+        "pthread_detach",
+        reinterpret_cast<void*>(&gn_vortek_probe_pthread_detach));
+    replace_main_export_addr(
+        "pthread_mutex_init",
+        reinterpret_cast<void*>(&gn_vortek_probe_pthread_mutex_init));
+    replace_main_export_addr(
+        "pthread_cond_init",
+        reinterpret_cast<void*>(&gn_vortek_probe_pthread_cond_init));
+    replace_main_export_addr(
+        "mmap",
+        reinterpret_cast<void*>(&gn_android_mmap));
+
+    if (solder_set_main_exports(
+            g_main_exports,
+            g_main_export_count) != 0) {
+        append_log("RUNTIME PROBE V35: failed to install pre-relocation bootstrap shims");
+        return;
+    }
+
+    append_log("RUNTIME PROBE V35: pre-relocation pthread/mmap shims installed");
 
     // V12 diagnostic isolation:
     // Do NOT reopen the target with autoload enabled here.
