@@ -3653,6 +3653,179 @@ void runtime_probe_leaf_module(std::string& result) {
         has_pthread_guard ? 1 : 0);
     append_log(summary);
 
+    // V35: first real execution attempt.
+    //
+    // Stop trying to reconstruct the stripped createVkContextForClient symbol:
+    // the exported createVkContext is the ABI entry point we actually have.
+    // Build only the tiny JNI surface that its upstream implementation uses
+    // during option translation, then let the real Vortek code run.
+    //
+    // Thread creation is temporarily made non-spawning for this bootstrap
+    // test. This avoids both Linux futex waits in requestHandlerThread and
+    // Bionic-vs-newlib pthread object layout differences. Once create returns
+    // successfully we can implement real worker threads as the next step.
+    append_log("RUNTIME PROBE V35: EXECUTE exported createVkContext with minimal JNI");
+
+    struct GnFakeJni {
+        void* table[233];
+        void* env_storage[1];
+    };
+
+    static auto gn_jni_get_object_class =
+        [](void*, void*) -> void* { return reinterpret_cast<void*>(0x1001); };
+
+    static auto gn_jni_get_field_id =
+        [](void*, void*, const char*, const char*) -> void* {
+            return reinterpret_cast<void*>(0x3001);
+        };
+
+    static auto gn_jni_get_object_field =
+        [](void*, void*, void*) -> void* { return nullptr; };
+
+    static auto gn_jni_get_byte_field =
+        [](void*, void*, void*) -> int8_t { return 0; };
+
+    static auto gn_jni_get_short_field =
+        [](void*, void*, void*) -> int16_t { return 0; };
+
+    static auto gn_jni_get_int_field =
+        [](void*, void*, void*) -> int32_t { return 0; };
+
+    static auto gn_jni_delete_local_ref =
+        [](void*, void*) -> void {};
+
+    static auto gn_jni_new_global_ref =
+        [](void*, void* obj) -> void* { return obj; };
+
+    static auto gn_jni_get_java_vm =
+        [](void*, void** out) -> int32_t {
+            if (out) *out = nullptr;
+            return 0;
+        };
+
+    GnFakeJni fake_jni{};
+    fake_jni.table[21]  = reinterpret_cast<void*>(+gn_jni_new_global_ref);   // NewGlobalRef
+    fake_jni.table[23]  = reinterpret_cast<void*>(+gn_jni_delete_local_ref); // DeleteLocalRef
+    fake_jni.table[31]  = reinterpret_cast<void*>(+gn_jni_get_object_class); // GetObjectClass
+    fake_jni.table[94]  = reinterpret_cast<void*>(+gn_jni_get_field_id);     // GetFieldID
+    fake_jni.table[95]  = reinterpret_cast<void*>(+gn_jni_get_object_field); // GetObjectField
+    fake_jni.table[97]  = reinterpret_cast<void*>(+gn_jni_get_byte_field);   // GetByteField
+    fake_jni.table[99]  = reinterpret_cast<void*>(+gn_jni_get_short_field);  // GetShortField
+    fake_jni.table[100] = reinterpret_cast<void*>(+gn_jni_get_int_field);    // GetIntField
+    fake_jni.table[219] = reinterpret_cast<void*>(+gn_jni_get_java_vm);      // GetJavaVM
+    fake_jni.env_storage[0] = fake_jni.table;
+
+    // Keep the Vortek pthread bootstrap self-contained for this first run.
+    // Eight ThreadPool workers + one request handler are all suppressed; the
+    // caller still sees successful pthread_create/pthread_detach calls and can
+    // therefore build the VkContext without entering Linux synchronization.
+    g_vortek_probe_pthread_create_count = 0;
+
+    struct V35ProbeState {
+        bool block_threads = false;
+    };
+    static V35ProbeState v35_state{};
+
+    // Save/replace pthread helpers in the main export table before the target
+    // relocation so Vortek's PLT binds to the safe bootstrap shims.
+    auto v35_noop_thread_create =
+        [](pthread_t* thread, const pthread_attr_t*, void* (*)(void*), void*) -> int {
+            if (thread) std::memset(thread, 0, sizeof(*thread));
+            ++g_vortek_probe_pthread_create_count;
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "RUNTIME PROBE V35: pthread_create suppressed #%d",
+                          g_vortek_probe_pthread_create_count);
+            append_log(msg);
+            return 0;
+        };
+
+    auto v35_noop_thread_detach =
+        [](pthread_t) -> int {
+            append_log("RUNTIME PROBE V35: pthread_detach suppressed");
+            return 0;
+        };
+
+    auto v35_noop_mutex_init =
+        [](pthread_mutex_t*, const pthread_mutexattr_t*) -> int {
+            append_log("RUNTIME PROBE V35: pthread_mutex_init suppressed");
+            return 0;
+        };
+
+    auto v35_noop_cond_init =
+        [](pthread_cond_t*, const pthread_condattr_t*) -> int {
+            append_log("RUNTIME PROBE V35: pthread_cond_init suppressed");
+            return 0;
+        };
+
+    const uintptr_t v35_real_pthread_create =
+        g_vortek_probe_original_pthread_create
+            ? reinterpret_cast<uintptr_t>(g_vortek_probe_original_pthread_create)
+            : 0;
+
+    (void)v35_state;
+    (void)v35_real_pthread_create;
+
+    replace_main_export_addr(
+        "pthread_create",
+        reinterpret_cast<void*>(+v35_noop_thread_create));
+    replace_main_export_addr(
+        "pthread_detach",
+        reinterpret_cast<void*>(+v35_noop_thread_detach));
+    replace_main_export_addr(
+        "pthread_mutex_init",
+        reinterpret_cast<void*>(+v35_noop_mutex_init));
+    replace_main_export_addr(
+        "pthread_cond_init",
+        reinterpret_cast<void*>(+v35_noop_cond_init));
+
+    // mmap is needed by RingBuffer_create. Force Vortek to our compatibility
+    // implementation rather than whichever default libc export solder happens
+    // to expose.
+    replace_main_export_addr(
+        "mmap",
+        reinterpret_cast<void*>(&gn_android_mmap));
+
+    if (solder_set_main_exports(
+            g_main_exports,
+            g_main_export_count) != 0) {
+        append_log("RUNTIME PROBE V35: failed to install execution shims");
+        return;
+    }
+
+    using GnCreateVkContextFn = void* (*)(void*, void*, int, void*);
+    const GnCreateVkContextFn create_fn =
+        reinterpret_cast<GnCreateVkContextFn>(native_create);
+
+    char exec_line[256];
+    std::snprintf(
+        exec_line, sizeof(exec_line),
+        "RUNTIME PROBE V35: calling createVkContext=%p fd=-1 options=NULL",
+        reinterpret_cast<void*>(native_create));
+    append_log(exec_line);
+    append_log("RUNTIME PROBE V35: ENTER");
+
+    void* v35_context =
+        create_fn(
+            fake_jni.env_storage,
+            reinterpret_cast<void*>(0x2001),
+            -1,
+            nullptr);
+
+    std::snprintf(
+        exec_line, sizeof(exec_line),
+        "RUNTIME PROBE V35: RETURN context=%p",
+        v35_context);
+    append_log(exec_line);
+
+    if (!v35_context) {
+        append_log("RUNTIME PROBE V35: createVkContext returned NULL");
+        append_log("RUNTIME PROBE V35: this is now an implementation failure, not a symbol-discovery failure");
+    } else {
+        append_log("RUNTIME PROBE V35: SUCCESS -- Vortek VkContext created");
+    }
+
+    append_log("RUNTIME PROBE V35: bootstrap execution complete");
     append_log("RUNTIME PROBE V34: refusing execution; callsite analysis only");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
