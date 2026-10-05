@@ -3082,7 +3082,261 @@ void runtime_probe_leaf_module(std::string& result) {
             dump_window("CALL TARGET", real, 48);
     }
 
-    append_log("RUNTIME PROBE V29: focused call-chain inspection complete; refusing all target execution");
+    append_log("RUNTIME PROBE V30: parse ELF local symbols and execute exact createVkContextForClient probe");
+
+    struct LocalSymbolHit {
+        uintptr_t value = 0;
+        bool found = false;
+    };
+
+    auto lookup_local_symbol_elf = [&](const char* path, const char* wanted,
+                                       uintptr_t known_runtime, uintptr_t known_dyn_value,
+                                       uintptr_t& out_bias) -> LocalSymbolHit {
+        LocalSymbolHit hit{};
+        out_bias = 0;
+
+        FILE* fp = std::fopen(path, "rb");
+        if (!fp) {
+            append_log("RUNTIME PROBE V30: fopen ELF FAILED");
+            return hit;
+        }
+
+        Elf64_Ehdr eh{};
+        if (std::fread(&eh, 1, sizeof(eh), fp) != sizeof(eh) ||
+            eh.e_ident[EI_MAG0] != ELFMAG0 ||
+            eh.e_ident[EI_MAG1] != ELFMAG1 ||
+            eh.e_ident[EI_MAG2] != ELFMAG2 ||
+            eh.e_ident[EI_MAG3] != ELFMAG3 ||
+            eh.e_ident[EI_CLASS] != ELFCLASS64) {
+            append_log("RUNTIME PROBE V30: invalid 64-bit ELF");
+            std::fclose(fp);
+            return hit;
+        }
+
+        std::vector<Elf64_Shdr> shdrs(eh.e_shnum);
+        if (eh.e_shoff == 0 || eh.e_shentsize != sizeof(Elf64_Shdr) ||
+            std::fseek(fp, static_cast<long>(eh.e_shoff), SEEK_SET) != 0 ||
+            std::fread(shdrs.data(), sizeof(Elf64_Shdr), shdrs.size(), fp) != shdrs.size()) {
+            append_log("RUNTIME PROBE V30: ELF section table read FAILED");
+            std::fclose(fp);
+            return hit;
+        }
+
+        for (size_t si = 0; si < shdrs.size(); ++si) {
+            const Elf64_Shdr& symsec = shdrs[si];
+            if (symsec.sh_type != SHT_SYMTAB && symsec.sh_type != SHT_DYNSYM)
+                continue;
+            if (symsec.sh_link >= shdrs.size())
+                continue;
+
+            const Elf64_Shdr& strsec = shdrs[symsec.sh_link];
+            std::vector<char> strtab(strsec.sh_size);
+            if (std::fseek(fp, static_cast<long>(strsec.sh_offset), SEEK_SET) != 0 ||
+                std::fread(strtab.data(), 1, strtab.size(), fp) != strtab.size())
+                continue;
+
+            const size_t sym_count = symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
+            if (sym_count == 0)
+                continue;
+
+            if (std::fseek(fp, static_cast<long>(symsec.sh_offset), SEEK_SET) != 0)
+                continue;
+
+            for (size_t i = 0; i < sym_count; ++i) {
+                Elf64_Sym sym{};
+                if (std::fread(&sym, 1, sizeof(sym), fp) != sizeof(sym))
+                    break;
+                if (sym.st_name >= strtab.size())
+                    continue;
+
+                const char* name = strtab.data() + sym.st_name;
+                if (std::strcmp(name, wanted) == 0 && sym.st_value != 0) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "RUNTIME PROBE V30: ELF symbol %s value=0x%llx section=%zu type=%u bind=%u",
+                                  wanted,
+                                  static_cast<unsigned long long>(sym.st_value),
+                                  static_cast<size_t>(sym.st_shndx),
+                                  static_cast<unsigned>(ELF64_ST_TYPE(sym.st_info)),
+                                  static_cast<unsigned>(ELF64_ST_BIND(sym.st_info)));
+                    append_log(msg);
+
+                    if (symsec.sh_type == SHT_DYNSYM && known_runtime && known_dyn_value) {
+                        out_bias = known_runtime - known_dyn_value;
+                    }
+
+                    if (symsec.sh_type == SHT_SYMTAB || hit.value == 0) {
+                        hit.value = sym.st_value;
+                        hit.found = true;
+                    }
+                }
+            }
+        }
+
+        std::fclose(fp);
+        return hit;
+    };
+
+    const std::string vortek_path = std::string(kNativeDir) + "/libvortekrenderer.so";
+    uintptr_t load_bias = 0;
+
+    // Derive ELF load bias from the exported createVkContext dynamic symbol.
+    uintptr_t dyn_value = 0;
+    {
+        FILE* fp = std::fopen(vortek_path.c_str(), "rb");
+        if (fp) {
+            Elf64_Ehdr eh{};
+            if (std::fread(&eh, 1, sizeof(eh), fp) == sizeof(eh) &&
+                eh.e_shoff && eh.e_shentsize == sizeof(Elf64_Shdr)) {
+                std::vector<Elf64_Shdr> shdrs(eh.e_shnum);
+                if (std::fseek(fp, static_cast<long>(eh.e_shoff), SEEK_SET) == 0 &&
+                    std::fread(shdrs.data(), sizeof(Elf64_Shdr), shdrs.size(), fp) == shdrs.size()) {
+                    for (const auto& symsec : shdrs) {
+                        if (symsec.sh_type != SHT_DYNSYM || symsec.sh_link >= shdrs.size())
+                            continue;
+                        const auto& strsec = shdrs[symsec.sh_link];
+                        std::vector<char> strtab(strsec.sh_size);
+                        if (std::fseek(fp, static_cast<long>(strsec.sh_offset), SEEK_SET) != 0 ||
+                            std::fread(strtab.data(), 1, strtab.size(), fp) != strtab.size())
+                            continue;
+                        if (std::fseek(fp, static_cast<long>(symsec.sh_offset), SEEK_SET) != 0)
+                            continue;
+                        const size_t count = symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
+                        for (size_t i = 0; i < count; ++i) {
+                            Elf64_Sym sym{};
+                            if (std::fread(&sym, 1, sizeof(sym), fp) != sizeof(sym))
+                                break;
+                            if (sym.st_name < strtab.size() &&
+                                std::strcmp(strtab.data() + sym.st_name, "createVkContext") == 0) {
+                                dyn_value = sym.st_value;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            std::fclose(fp);
+        }
+    }
+
+    if (dyn_value && native_create) {
+        load_bias = reinterpret_cast<uintptr_t>(native_create) - dyn_value;
+        char bias_line[256];
+        std::snprintf(bias_line, sizeof(bias_line),
+                      "RUNTIME PROBE V30: createVkContext dyn_value=0x%llx runtime=%p load_bias=0x%llx",
+                      static_cast<unsigned long long>(dyn_value),
+                      native_create,
+                      static_cast<unsigned long long>(load_bias));
+        append_log(bias_line);
+    } else {
+        append_log("RUNTIME PROBE V30: could not derive ELF load bias");
+    }
+
+    uintptr_t local_value = 0;
+    {
+        FILE* fp = std::fopen(vortek_path.c_str(), "rb");
+        bool found = false;
+        if (fp) {
+            Elf64_Ehdr eh{};
+            if (std::fread(&eh, 1, sizeof(eh), fp) == sizeof(eh) &&
+                eh.e_shoff && eh.e_shentsize == sizeof(Elf64_Shdr)) {
+                std::vector<Elf64_Shdr> shdrs(eh.e_shnum);
+                if (std::fseek(fp, static_cast<long>(eh.e_shoff), SEEK_SET) == 0 &&
+                    std::fread(shdrs.data(), sizeof(Elf64_Shdr), shdrs.size(), fp) == shdrs.size()) {
+                    for (const auto& symsec : shdrs) {
+                        if (symsec.sh_type != SHT_SYMTAB || symsec.sh_link >= shdrs.size())
+                            continue;
+                        const auto& strsec = shdrs[symsec.sh_link];
+                        std::vector<char> strtab(strsec.sh_size);
+                        if (std::fseek(fp, static_cast<long>(strsec.sh_offset), SEEK_SET) != 0 ||
+                            std::fread(strtab.data(), 1, strtab.size(), fp) != strtab.size())
+                            continue;
+                        if (std::fseek(fp, static_cast<long>(symsec.sh_offset), SEEK_SET) != 0)
+                            continue;
+                        const size_t count = symsec.sh_entsize ? symsec.sh_size / symsec.sh_entsize : 0;
+                        for (size_t i = 0; i < count; ++i) {
+                            Elf64_Sym sym{};
+                            if (std::fread(&sym, 1, sizeof(sym), fp) != sizeof(sym))
+                                break;
+                            if (sym.st_name < strtab.size() &&
+                                std::strcmp(strtab.data() + sym.st_name, "createVkContextForClient") == 0) {
+                                local_value = sym.st_value;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            std::fclose(fp);
+        }
+        if (!found)
+            append_log("RUNTIME PROBE V30: createVkContextForClient NOT PRESENT in .symtab");
+    }
+
+    if (!local_value || !load_bias) {
+        append_log("RUNTIME PROBE V30: exact local symbol unavailable; refusing execution");
+        append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
+        return;
+    }
+
+    const uintptr_t exact_target = load_bias + local_value;
+    {
+        char addr_line[256];
+        std::snprintf(addr_line, sizeof(addr_line),
+                      "RUNTIME PROBE V30: createVkContextForClient exact runtime=%p (st_value=0x%llx)",
+                      reinterpret_cast<void*>(exact_target),
+                      static_cast<unsigned long long>(local_value));
+        append_log(addr_line);
+    }
+
+    append_log("RUNTIME PROBE V30: exact local symbol found; dumping prologue before execution");
+    for (int i = 0; i < 32; ++i) {
+        const uintptr_t pc = exact_target + static_cast<uintptr_t>(i * 4);
+        uint32_t word = 0;
+        std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
+        char insn_line[256];
+        std::snprintf(insn_line, sizeof(insn_line),
+                      "RUNTIME PROBE V30: EXACT insn[%02d] pc=%p word=0x%08x",
+                      i, reinterpret_cast<void*>(pc), word);
+        append_log(insn_line);
+        if (word == 0xD65F03C0U)
+            break;
+    }
+
+    struct VortekContextOptionsProbe {
+        int vkMaxVersion;
+        short maxDeviceMemory;
+        short imageCacheSize;
+        signed char resourceMemoryType;
+        const char* const* exposedDeviceExtensions;
+        int exposedDeviceExtensionCount;
+    } options{};
+
+    options.vkMaxVersion = 0x00403080;
+    options.maxDeviceMemory = 0;
+    options.imageCacheSize = 256;
+    options.resourceMemoryType = 0;
+    options.exposedDeviceExtensions = nullptr;
+    options.exposedDeviceExtensionCount = 0;
+
+    using CreateVkContextForClientFn =
+        void* (*)(int, const VortekContextOptionsProbe*, const void*);
+
+    append_log("RUNTIME PROBE V30: calling exact createVkContextForClient with synthetic fd=-1 and NULL JMethods");
+    const auto exact_create =
+        reinterpret_cast<CreateVkContextForClientFn>(exact_target);
+
+    void* context = exact_create(-1, &options, nullptr);
+
+    const int saved_errno = errno;
+    char result_line[256];
+    std::snprintf(result_line, sizeof(result_line),
+                  "RUNTIME PROBE V30: exact createVkContextForClient RETURNED context=%p errno=%d",
+                  context, saved_errno);
+    append_log(result_line);
+
+    append_log("RUNTIME PROBE V30: exact local-symbol execution complete");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
