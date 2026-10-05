@@ -3716,10 +3716,10 @@ void runtime_probe_leaf_module(std::string& result) {
             const uintptr_t dst = decode_bl(pc, w0);
             const uintptr_t real = follow_branch_chain(dst);
 
-            if (v33_calloc && real == v33_calloc)
+            if (v34_calloc && real == v34_calloc)
                 ++v34_calloc_calls;
 
-            if (v33_mutex_init && real == v33_mutex_init)
+            if (v34_mutex_init && real == v34_mutex_init)
                 ++v34_mutex_calls;
         }
 
