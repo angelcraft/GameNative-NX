@@ -2864,24 +2864,38 @@ void runtime_probe_leaf_module(std::string& result) {
         }
     }
 
-    append_log("RUNTIME PROBE V26: resolving recovered JNI BL through AArch64 PLT/GOT (NO CALL)");
+    append_log("RUNTIME PROBE V27: tracing JNI -> PLT/GOT -> real function -> next BL chain (NO CALL)");
     uintptr_t recovered_plt = 0;
     if (resolved) {
         const uintptr_t jni_pc = reinterpret_cast<uintptr_t>(resolved);
         for (int i = 0; i < 96; ++i) {
             uint32_t insn = 0;
             std::memcpy(&insn, reinterpret_cast<const void*>(jni_pc + i * 4), sizeof(insn));
-            if ((insn & 0xFC000000U) == 0x94000000U) {
-                int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
-                if (imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
-                recovered_plt = jni_pc + i * 4 + (static_cast<int64_t>(imm26) << 2);
-                char line2[256];
+            if ((insn & 0xFC000000U) != 0x94000000U)
+                continue;
+
+            int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
+            if (imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
+            recovered_plt = jni_pc + i * 4 + (static_cast<int64_t>(imm26) << 2);
+
+            char line2[256];
+            std::snprintf(line2, sizeof(line2),
+                          "RUNTIME PROBE V27: recovered JNI BL[%d] PLT=%p",
+                          i, reinterpret_cast<void*>(recovered_plt));
+            append_log(line2);
+
+            const int begin = (i > 16) ? i - 16 : 0;
+            const int finish = i + 8;
+            append_log("RUNTIME PROBE V27: dumping JNI call-site context (NO CALL)");
+            for (int j = begin; j <= finish; ++j) {
+                uint32_t word = 0;
+                std::memcpy(&word, reinterpret_cast<const void*>(jni_pc + j * 4), sizeof(word));
                 std::snprintf(line2, sizeof(line2),
-                              "RUNTIME PROBE V26: recovered JNI BL[%d] PLT=%p",
-                              i, reinterpret_cast<void*>(recovered_plt));
+                              "RUNTIME PROBE V27: JNI insn[%03d] pc=%p word=0x%08x",
+                              j, reinterpret_cast<void*>(jni_pc + j * 4), word);
                 append_log(line2);
-                break;
             }
+            break;
         }
     }
 
@@ -2895,11 +2909,13 @@ void runtime_probe_leaf_module(std::string& result) {
 
         char line2[256];
         std::snprintf(line2, sizeof(line2),
-                      "RUNTIME PROBE V26: PLT words %08x %08x %08x %08x", a, l, ad, br);
+                      "RUNTIME PROBE V27: PLT words %08x %08x %08x %08x", a, l, ad, br);
         append_log(line2);
 
         const bool is_adrp = (a & 0x9F000000U) == 0x90000000U;
-        const bool is_ldr_x17 = (l & 0xFFC00000U) == 0xF9400000U && ((l >> 5) & 0x1FU) == 16 && (l & 0x1FU) == 17;
+        const bool is_ldr_x17 = (l & 0xFFC00000U) == 0xF9400000U &&
+                                ((l >> 5) & 0x1FU) == 16 &&
+                                (l & 0x1FU) == 17;
         const bool is_add_x16_x16 = (ad & 0xFF00001FU) == 0x91000010U;
         const bool is_br_x17 = br == 0xD61F0220U;
 
@@ -2913,30 +2929,90 @@ void runtime_probe_leaf_module(std::string& result) {
             resolved_target = static_cast<uintptr_t>(target64);
 
             std::snprintf(line2, sizeof(line2),
-                          "RUNTIME PROBE V26: PLT/GOT page=%p GOT=%p target=%p",
-                          reinterpret_cast<void*>(x16_page), reinterpret_cast<void*>(got), reinterpret_cast<void*>(resolved_target));
+                          "RUNTIME PROBE V27: PLT/GOT page=%p GOT=%p target=%p",
+                          reinterpret_cast<void*>(x16_page), reinterpret_cast<void*>(got),
+                          reinterpret_cast<void*>(resolved_target));
             append_log(line2);
 
             if (resolved_target) {
-                append_log("RUNTIME PROBE V26: dumping first 48 instructions at resolved target");
-                for (int i = 0; i < 48; ++i) {
+                append_log("RUNTIME PROBE V27: dumping resolved function and collecting direct BL targets");
+
+                uintptr_t bl_targets[16]{};
+                int bl_count = 0;
+                int resolved_ret_index = -1;
+
+                for (int i = 0; i < 96; ++i) {
                     uint32_t insn = 0;
                     std::memcpy(&insn, reinterpret_cast<const void*>(resolved_target + i * 4), sizeof(insn));
+
                     std::snprintf(line2, sizeof(line2),
-                                  "RUNTIME PROBE V26: RESOLVED insn[%02d] pc=%p word=0x%08x",
+                                  "RUNTIME PROBE V27: RESOLVED insn[%02d] pc=%p word=0x%08x",
                                   i, reinterpret_cast<void*>(resolved_target + i * 4), insn);
                     append_log(line2);
-                    if (insn == 0xD65F03C0U) break;
+
+                    if ((insn & 0xFC000000U) == 0x94000000U) {
+                        int32_t imm26 = static_cast<int32_t>(insn & 0x03FFFFFFU);
+                        if (imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000U);
+                        const uintptr_t dst = resolved_target + i * 4 + (static_cast<int64_t>(imm26) << 2);
+
+                        std::snprintf(line2, sizeof(line2),
+                                      "RUNTIME PROBE V27: RESOLVED BL[%d] pc=%p -> %p",
+                                      i, reinterpret_cast<void*>(resolved_target + i * 4),
+                                      reinterpret_cast<void*>(dst));
+                        append_log(line2);
+
+                        bool seen = false;
+                        for (int k = 0; k < bl_count; ++k) {
+                            if (bl_targets[k] == dst) {
+                                seen = true;
+                                break;
+                            }
+                        }
+                        if (!seen && bl_count < 16)
+                            bl_targets[bl_count++] = dst;
+                    }
+
+                    if (insn == 0xD65F03C0U) {
+                        resolved_ret_index = i;
+                        break;
+                    }
+                }
+
+                if (resolved_ret_index >= 0) {
+                    std::snprintf(line2, sizeof(line2),
+                                  "RUNTIME PROBE V27: resolved function RET at instruction[%d]",
+                                  resolved_ret_index);
+                    append_log(line2);
+                }
+
+                for (int c = 0; c < bl_count; ++c) {
+                    const uintptr_t base = bl_targets[c];
+                    std::snprintf(line2, sizeof(line2),
+                                  "RUNTIME PROBE V27: NEXT TARGET[%d] addr=%p",
+                                  c, reinterpret_cast<void*>(base));
+                    append_log(line2);
+
+                    for (int i = 0; i < 64; ++i) {
+                        uint32_t insn = 0;
+                        std::memcpy(&insn, reinterpret_cast<const void*>(base + i * 4), sizeof(insn));
+                        std::snprintf(line2, sizeof(line2),
+                                      "RUNTIME PROBE V27: NEXT TARGET[%d] insn[%02d] pc=%p word=0x%08x",
+                                      c, i, reinterpret_cast<void*>(base + i * 4), insn);
+                        append_log(line2);
+
+                        if (insn == 0xD65F03C0U)
+                            break;
+                    }
                 }
             }
         } else {
-            append_log("RUNTIME PROBE V26: recovered target was not the expected AArch64 PLT form");
+            append_log("RUNTIME PROBE V27: recovered target was not the expected AArch64 PLT form");
         }
     } else {
-        append_log("RUNTIME PROBE V26: could not recover JNI BL target");
+        append_log("RUNTIME PROBE V27: could not recover JNI BL target");
     }
 
-    append_log("RUNTIME PROBE V26: PLT/GOT inspection complete; refusing target execution");
+    append_log("RUNTIME PROBE V27: branch-chain inspection complete; refusing all target execution");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
