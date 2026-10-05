@@ -500,9 +500,8 @@ extern "C" void* gn_android_mmap(
         return reinterpret_cast<void*>(-1);
     }
 
-    void* memory = nullptr;
-    const int rc = ::posix_memalign(&memory, 0x1000, total);
-    if (rc != 0 || !memory) {
+    void* memory = ::malloc(total);
+    if (!memory) {
         errno = ENOMEM;
         return reinterpret_cast<void*>(-1);
     }
