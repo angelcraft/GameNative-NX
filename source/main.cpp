@@ -3704,6 +3704,7 @@ void runtime_probe_leaf_module(std::string& result) {
             top.has_client_literal ? 1 : 0,
             top.has_setup_bl ? 1 : 0,
             top.near_create ? 1 : 0);
+        append_log(msg);
     } else {
         append_log("RUNTIME PROBE V33: no candidates matched");
     }
@@ -3712,45 +3713,6 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
-    struct VortekContextOptionsProbe {
-        int vkMaxVersion;
-        short maxDeviceMemory;
-        short imageCacheSize;
-        signed char resourceMemoryType;
-        const char* const* exposedDeviceExtensions;
-        int exposedDeviceExtensionCount;
-    } options{};
-
-    options.vkMaxVersion = 0x00403080;
-    options.maxDeviceMemory = 0;
-    options.imageCacheSize = 256;
-    options.resourceMemoryType = 0;
-    options.exposedDeviceExtensions = nullptr;
-    options.exposedDeviceExtensionCount = 0;
-
-    using CreateVkContextForClientFn =
-        void* (*)(int, const VortekContextOptionsProbe*, const void*);
-
-    append_log(
-        "RUNTIME PROBE V31: calling exact candidate with synthetic fd=-1 and NULL JMethods");
-    const auto exact_create =
-        reinterpret_cast<CreateVkContextForClientFn>(exact_target);
-
-    void* context = exact_create(-1, &options, nullptr);
-
-    const int saved_errno = errno;
-    char result_line[256];
-    std::snprintf(
-        result_line, sizeof(result_line),
-        "RUNTIME PROBE V31: exact candidate RETURNED context=%p errno=%d",
-        context, saved_errno);
-    append_log(result_line);
-
-    append_log("RUNTIME PROBE V31: exact createVkContextForClient execution complete");
-    append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
-    return;
-
-}
 
 } // namespace
 
