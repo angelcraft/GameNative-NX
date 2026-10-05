@@ -133,30 +133,37 @@ static int gn_vortek_probe_pthread_cond_init(
 
 static int gn_vortek_probe_pthread_create(
     pthread_t* thread,
-    const pthread_attr_t* attr,
-    void* (*start_routine)(void*),
-    void* arg) {
-    const int call_index = __atomic_add_fetch(
-        &g_vortek_probe_pthread_create_count, 1, __ATOMIC_SEQ_CST);
+    const pthread_attr_t*,
+    void* (*)(void*),
+    void*) {
+    if (thread)
+        std::memset(thread, 0, sizeof(*thread));
 
-    // createVkContextForClient() first creates Vortek's 8 detached
-    // ThreadPool workers, then setupRingBuffers() creates exactly one
-    // requestHandlerThread. Let the workers exist, but prevent the
-    // request handler from entering Linux futex/ring-buffer waits on
-    // Horizon.
-    if (call_index == 9) {
-        append_log("RUNTIME PROBE V20: blocking 9th pthread_create (requestHandlerThread) -> EAGAIN");
-        errno = EAGAIN;
-        return EAGAIN;
-    }
+    const int call_index =
+        __atomic_add_fetch(&g_vortek_probe_pthread_create_count, 1, __ATOMIC_SEQ_CST);
 
-    if (!g_vortek_probe_original_pthread_create) {
-        errno = ENOSYS;
-        return ENOSYS;
-    }
+    append_log(("RUNTIME PROBE V35: pthread_create suppressed #" +
+                std::to_string(call_index)).c_str());
+    return 0;
+}
 
-    return g_vortek_probe_original_pthread_create(
-        thread, attr, start_routine, arg);
+static int gn_vortek_probe_pthread_detach(pthread_t) {
+    append_log("RUNTIME PROBE V35: pthread_detach suppressed");
+    return 0;
+}
+
+static int gn_vortek_probe_pthread_mutex_init(
+    pthread_mutex_t*,
+    const pthread_mutexattr_t*) {
+    append_log("RUNTIME PROBE V35: pthread_mutex_init suppressed");
+    return 0;
+}
+
+static int gn_vortek_probe_pthread_cond_init(
+    pthread_cond_t*,
+    const pthread_condattr_t*) {
+    append_log("RUNTIME PROBE V35: pthread_cond_init suppressed");
+    return 0;
 }
 
 static ssize_t gn_vortek_probe_sendmsg(
@@ -3763,78 +3770,6 @@ void runtime_probe_leaf_module(std::string& result) {
     // caller still sees successful pthread_create/pthread_detach calls and can
     // therefore build the VkContext without entering Linux synchronization.
     g_vortek_probe_pthread_create_count = 0;
-
-    struct V35ProbeState {
-        bool block_threads = false;
-    };
-    static V35ProbeState v35_state{};
-
-    // Save/replace pthread helpers in the main export table before the target
-    // relocation so Vortek's PLT binds to the safe bootstrap shims.
-    auto v35_noop_thread_create =
-        [](pthread_t* thread, const pthread_attr_t*, void* (*)(void*), void*) -> int {
-            if (thread) std::memset(thread, 0, sizeof(*thread));
-            ++g_vortek_probe_pthread_create_count;
-            char msg[160];
-            std::snprintf(msg, sizeof(msg),
-                          "RUNTIME PROBE V35: pthread_create suppressed #%d",
-                          g_vortek_probe_pthread_create_count);
-            append_log(msg);
-            return 0;
-        };
-
-    auto v35_noop_thread_detach =
-        [](pthread_t) -> int {
-            append_log("RUNTIME PROBE V35: pthread_detach suppressed");
-            return 0;
-        };
-
-    auto v35_noop_mutex_init =
-        [](pthread_mutex_t*, const pthread_mutexattr_t*) -> int {
-            append_log("RUNTIME PROBE V35: pthread_mutex_init suppressed");
-            return 0;
-        };
-
-    auto v35_noop_cond_init =
-        [](pthread_cond_t*, const pthread_condattr_t*) -> int {
-            append_log("RUNTIME PROBE V35: pthread_cond_init suppressed");
-            return 0;
-        };
-
-    const uintptr_t v35_real_pthread_create =
-        g_vortek_probe_original_pthread_create
-            ? reinterpret_cast<uintptr_t>(g_vortek_probe_original_pthread_create)
-            : 0;
-
-    (void)v35_state;
-    (void)v35_real_pthread_create;
-
-    replace_main_export_addr(
-        "pthread_create",
-        reinterpret_cast<void*>(+v35_noop_thread_create));
-    replace_main_export_addr(
-        "pthread_detach",
-        reinterpret_cast<void*>(+v35_noop_thread_detach));
-    replace_main_export_addr(
-        "pthread_mutex_init",
-        reinterpret_cast<void*>(+v35_noop_mutex_init));
-    replace_main_export_addr(
-        "pthread_cond_init",
-        reinterpret_cast<void*>(+v35_noop_cond_init));
-
-    // mmap is needed by RingBuffer_create. Force Vortek to our compatibility
-    // implementation rather than whichever default libc export solder happens
-    // to expose.
-    replace_main_export_addr(
-        "mmap",
-        reinterpret_cast<void*>(&gn_android_mmap));
-
-    if (solder_set_main_exports(
-            g_main_exports,
-            g_main_export_count) != 0) {
-        append_log("RUNTIME PROBE V35: failed to install execution shims");
-        return;
-    }
 
     using GnCreateVkContextFn = void* (*)(void*, void*, int, void*);
     const GnCreateVkContextFn create_fn =
