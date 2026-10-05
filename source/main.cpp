@@ -3657,6 +3657,154 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
+    // V34: analyze the actual createVkContext body directly.
+    // The V31 literal references land inside the exported createVkContext
+    // body in this build, which strongly suggests createVkContextForClient()
+    // and/or setupRingBuffers() were inlined by the optimizer/LTO.
+    // Keep this pass analysis-only: no recovered function is executed.
+    append_log("RUNTIME PROBE V34: analyze createVkContext body for inlined client setup");
+
+    uintptr_t v34_create_end = 0;
+    const uintptr_t v34_create_begin = create_pc;
+
+    for (int i = 0; i < 1024; ++i) {
+        const uintptr_t pc = v34_create_begin + static_cast<uintptr_t>(i * 4);
+        if (pc >= v31_text_end)
+            break;
+
+        uint32_t word = 0;
+        std::memcpy(&word, reinterpret_cast<const void*>(pc), sizeof(word));
+
+        if (i > 8 && word == 0xD65F03C0U) {
+            v34_create_end = pc + 4;
+            break;
+        }
+    }
+
+    if (!v34_create_end) {
+        v34_create_end = std::min(
+            v31_text_end,
+            v34_create_begin + static_cast<uintptr_t>(0x2000));
+    }
+
+    {
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V34: create body=%p..%p size=0x%llx",
+            reinterpret_cast<void*>(v34_create_begin),
+            reinterpret_cast<void*>(v34_create_end),
+            static_cast<unsigned long long>(v34_create_end - v34_create_begin));
+        append_log(msg);
+    }
+
+    int v34_calloc_calls = 0;
+    int v34_mutex_calls = 0;
+    int v34_server_refs = 0;
+    int v34_client_refs = 0;
+    int v34_unconditional_branches = 0;
+
+    for (uintptr_t pc = v34_create_begin;
+         pc + 8 <= v34_create_end;
+         pc += 4) {
+        uint32_t w0 = 0;
+        uint32_t w1 = 0;
+        std::memcpy(&w0, reinterpret_cast<const void*>(pc), sizeof(w0));
+        std::memcpy(&w1, reinterpret_cast<const void*>(pc + 4), sizeof(w1));
+
+        if (is_bl(w0)) {
+            const uintptr_t dst = decode_bl(pc, w0);
+            const uintptr_t real = follow_branch_chain(dst);
+
+            if (v33_calloc && real == v33_calloc)
+                ++v34_calloc_calls;
+
+            if (v33_mutex_init && real == v33_mutex_init)
+                ++v34_mutex_calls;
+        }
+
+        if (is_adrp(w0)) {
+            const unsigned reg = w0 & 0x1FU;
+            if (((w1 >> 5) & 0x1FU) == reg &&
+                (w1 & 0x1FU) == reg &&
+                (w1 & 0xFF00001FU) == 0x91000000U) {
+                const uintptr_t lit = add_immediate_target(
+                    adrp_target(pc, w0), w1);
+
+                if (!server_ring_strings.empty() &&
+                    lit == server_ring_strings[0]) {
+                    ++v34_server_refs;
+                    char msg[256];
+                    std::snprintf(
+                        msg, sizeof(msg),
+                        "RUNTIME PROBE V34: create references vt-server-ring at pc=%p",
+                        reinterpret_cast<void*>(pc));
+                    append_log(msg);
+                }
+
+                if (!client_ring_strings.empty() &&
+                    lit == client_ring_strings[0]) {
+                    ++v34_client_refs;
+                    char msg[256];
+                    std::snprintf(
+                        msg, sizeof(msg),
+                        "RUNTIME PROBE V34: create references vt-client-ring at pc=%p",
+                        reinterpret_cast<void*>(pc));
+                    append_log(msg);
+                }
+            }
+        }
+
+        if (is_b(w0)) {
+            const uintptr_t dst = decode_b(pc, w0);
+            ++v34_unconditional_branches;
+
+            char msg[256];
+            std::snprintf(
+                msg, sizeof(msg),
+                "RUNTIME PROBE V34: CREATE B pc=%p -> %p%s",
+                reinterpret_cast<void*>(pc),
+                reinterpret_cast<void*>(dst),
+                (dst == setup_candidate) ? " [SETUP_RING_TARGET]" : "");
+            append_log(msg);
+
+            if (dst >= v31_text_begin && dst + 96 <= v31_text_end) {
+                uint32_t first = 0;
+                std::memcpy(&first, reinterpret_cast<const void*>(dst), sizeof(first));
+                if (is_stp_fp_lr_preindex(first)) {
+                    append_log("RUNTIME PROBE V34: B target has normal function prologue");
+                    for (int j = 0; j < 24; ++j) {
+                        const uintptr_t tpc = dst + static_cast<uintptr_t>(j * 4);
+                        uint32_t tw = 0;
+                        std::memcpy(&tw, reinterpret_cast<const void*>(tpc), sizeof(tw));
+                        char insn_line[256];
+                        std::snprintf(
+                            insn_line, sizeof(insn_line),
+                            "RUNTIME PROBE V34: B TARGET insn[%02d] pc=%p word=0x%08x",
+                            j, reinterpret_cast<void*>(tpc), tw);
+                        append_log(insn_line);
+                        if (tw == 0xD65F03C0U)
+                            break;
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        char msg[256];
+        std::snprintf(
+            msg, sizeof(msg),
+            "RUNTIME PROBE V34: create inline-signature calloc=%d mutex_init=%d server_refs=%d client_refs=%d B=%d",
+            v34_calloc_calls,
+            v34_mutex_calls,
+            v34_server_refs,
+            v34_client_refs,
+            v34_unconditional_branches);
+        append_log(msg);
+    }
+
+    append_log("RUNTIME PROBE V34: if ring refs are inside create, treat create as the inlined client-context candidate");
     append_log("RUNTIME PROBE V33: refusing execution; candidate analysis only");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
