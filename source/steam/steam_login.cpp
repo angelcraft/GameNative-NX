@@ -115,7 +115,23 @@ static bool download_depot_chunks(const std::string& host, uint32_t depot, uint6
         const std::string url = "https://" + host + "/depot/" + std::to_string(depot) + "/chunk/" + chunk.sha;
         NetResponse response{};
         bool saved = false;
-        if (net_download_get(connection, url.c_str(), &response) && response.status == 200 && response.len == chunk.compressed) {
+        bool received = false;
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            const bool transfer = net_download_get(connection, url.c_str(), &response);
+            received = transfer && response.status == 200 && response.len == chunk.compressed;
+            if (received || attempt == 2) break;
+            if (transfer && response.status >= 400 && response.status < 500 &&
+                response.status != 408 && response.status != 429) break;
+            net_response_free(&response);
+            padUpdate(&pad);
+            if (!appletMainLoop() || (padGetButtonsDown(&pad) & HidNpadButton_B)) {
+                cancelled = true;
+                break;
+            }
+            svcSleepThread(250000000LL * (attempt + 1));
+        }
+        if (cancelled) break;
+        if (received) {
             if (key && !decode_depot_chunk(chunk, key, response.body, response.len, decoded)) {
                 log_printf("Depot %u chunk %zu: decrypt/decompress/integrity validation failed\n", depot, i+1);
                 net_response_free(&response);

@@ -1,3 +1,4 @@
+#include <new>
 #include <switch.h>
 #include <solder.h>
 #include "android_compat.hpp"
@@ -167,6 +168,43 @@ static PthreadCreateProbeFn g_vortek_probe_original_pthread_create = nullptr;
 static int g_vortek_probe_pthread_create_count = 0;
 static bool g_vortek_probe_started_workers = false;
 
+// The NX toolchain uses the software thread-pointer ABI. Check the linked
+// implementation before exposing a separate Android TPIDR_EL0 to guest code.
+extern "C" void* __aarch64_read_tp();
+class VortekGuestTls {
+    alignas(16) u64 slots[12]{};
+    u64 saved = 0;
+    bool active = false;
+public:
+    VortekGuestTls() {
+        // Four words before TP leave room for Bionic's negative slots.
+        randomGet(&slots[9], sizeof(slots[9]));
+        slots[9] |= 0x100; // A nonzero canary in Bionic slot 5.
+        auto read_host = &__aarch64_read_tp;
+        void* host = read_host();
+        asm volatile("mrs %0, tpidr_el0" : "=r"(saved));
+        const auto guest = reinterpret_cast<u64>(&slots[4]);
+        asm volatile("msr tpidr_el0, %0; isb" :: "r"(guest) : "memory");
+        active = read_host() == host;
+        if (!active) asm volatile("msr tpidr_el0, %0; isb" :: "r"(saved) : "memory");
+    }
+    ~VortekGuestTls() {
+        if (active) asm volatile("msr tpidr_el0, %0; isb" :: "r"(saved) : "memory");
+    }
+    bool ready() const { return active; }
+    VortekGuestTls(const VortekGuestTls&) = delete;
+    VortekGuestTls& operator=(const VortekGuestTls&) = delete;
+};
+
+struct VortekWorker { void* (*start)(void*); void* argument; };
+static void* vortek_worker_entry(void* opaque) {
+    const auto worker = *static_cast<VortekWorker*>(opaque);
+    delete static_cast<VortekWorker*>(opaque);
+    VortekGuestTls tls;
+    if (!tls.ready()) return nullptr;
+    return worker.start(worker.argument);
+}
+
 static int gn_vortek_probe_pthread_create(
     pthread_t* thread,
     const pthread_attr_t* attr,
@@ -185,7 +223,10 @@ static int gn_vortek_probe_pthread_create(
         return EAGAIN;
     }
 
-    const int rc = g_vortek_probe_original_pthread_create(thread, attr, start_routine, arg);
+    auto* worker = new (std::nothrow) VortekWorker{start_routine, arg};
+    if (!worker) return EAGAIN;
+    const int rc = g_vortek_probe_original_pthread_create(thread, attr, vortek_worker_entry, worker);
+    if (rc != 0) delete worker;
     if (rc == 0)
         __atomic_store_n(&g_vortek_probe_started_workers, true, __ATOMIC_RELAXED);
     vortek_trace("pthread_create #%d return rc=%d", call_index, rc);
@@ -3859,35 +3900,35 @@ void runtime_probe_leaf_module(std::string& result) {
     vortek_trace("TPIDR_EL0=%016llx", static_cast<unsigned long long>(thread_pointer));
     for (unsigned i = 0; i < 16; ++i)
         vortek_trace("createVkContext+0x%02x instruction=%08x", i * 4, entry_words[i]);
-    // This prologue reads Bionic's stack guard from TPIDR_EL0 + 0x28.
-    // Check Horizon's memory map before executing the known incompatible load.
-    if (entry_words[8] == 0xd53bd05c && entry_words[9] == 0xf9401788) {
-        const u64 guard_address = thread_pointer + 0x28;
-        MemoryInfo info{};
-        u32 page_info = 0;
-        const Result rc = svcQueryMemory(&info, &page_info, guard_address);
-        if (R_FAILED(rc) || !(info.perm & Perm_R) ||
-            guard_address - info.addr > info.size ||
-            info.size - (guard_address - info.addr) < sizeof(u64)) {
-            result = "V35 stopped before execution: Android stack guard is outside readable TLS";
-            vortek_trace("%s", result.c_str());
-            return;
-        }
+    if (entry_words[8] != 0xd53bd05c || entry_words[9] != 0xf9401788) {
+        result = "V35: unexpected Android entry prologue";
+        return;
     }
     vortek_trace("enter native createVkContext");
 
     const int fault_fd = ::open(kLog, O_WRONLY | O_APPEND);
     vortek_trace("exception logging %s", fault_fd >= 0 ? "armed" : "unavailable");
     __atomic_store_n(&g_vortek_fault_fd, fault_fd, __ATOMIC_RELAXED);
-    void* v35_context =
-        create_fn(
-            fake_jni.env_storage,
-            reinterpret_cast<void*>(0x2001),
-            -1,
-            nullptr);
+    void* v35_context = nullptr;
+    bool guest_ready = false;
+    {
+        VortekGuestTls tls;
+        guest_ready = tls.ready();
+        if (guest_ready) {
+            vortek_trace("Android stack guard installed in guest TLS");
+            v35_context = create_fn(fake_jni.env_storage, reinterpret_cast<void*>(0x2001),
+                                    -1, nullptr);
+        }
+    }
     __atomic_store_n(&g_vortek_fault_fd, -1, __ATOMIC_RELAXED);
     if (fault_fd >= 0)
         ::close(fault_fd);
+
+    if (!guest_ready) {
+        result = "V35: libnx thread pointer depends on TPIDR_EL0";
+        vortek_trace("%s", result.c_str());
+        return;
+    }
 
     std::snprintf(
         exec_line, sizeof(exec_line),
