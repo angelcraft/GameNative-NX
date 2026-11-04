@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 extern "C" {
 #include "steam_auth.h"
@@ -76,6 +77,61 @@ static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t s
         }
     }
     return count;
+}
+
+static size_t fetch_manifest(SteamCM& cm, uint32_t depot, uint64_t manifest, uint64_t code) {
+    PbBuf query{};
+    pb_varint(&query, 2, 20);
+    uint8_t* response = nullptr;
+    size_t length = 0;
+    const int result = query.error ? CM_TRANSPORT_ERROR :
+        cm_call(&cm, "ContentServerDirectory.GetServersForSteamPipe#1", &query, &response, &length);
+    pb_free(&query);
+    if (result != 1) return 0;
+
+    PbReader reader;
+    PbField field;
+    pb_reader(&reader, response, length);
+    size_t saved = 0;
+    unsigned attempts = 0;
+    while (attempts < 3 && !saved && pb_next(&reader, &field)) {
+        if (field.field != 1 || field.wire != PB_BYTES) continue;
+        char hostname[128]{};
+        if (!pb_get_string(field.data, field.len, 9, hostname, sizeof(hostname)) &&
+            !pb_get_string(field.data, field.len, 8, hostname, sizeof(hostname))) continue;
+        const std::string host(hostname);
+        const std::string suffix = ".steamcontent.com";
+        if (host.size() <= suffix.size() ||
+            host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0 ||
+            host.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-") != std::string::npos)
+            continue;
+        ++attempts;
+
+        const std::string url = "https://" + host + "/depot/" + std::to_string(depot) +
+            "/manifest/" + std::to_string(manifest) + "/5/" + std::to_string(code);
+        NetResponse download{};
+        if (net_get(url.c_str(), &download) && download.status == 200 &&
+            download.len >= 4 && std::memcmp(download.body, "PK\x03\x04", 4) == 0) {
+            constexpr const char* folder = "sdmc:/switch/gamenative_nx/manifests";
+            mkdir(folder, 0777);
+            const std::string path = std::string(folder) + "/" + std::to_string(depot) +
+                "_" + std::to_string(manifest) + ".zip";
+            const std::string temporary = path + ".tmp";
+            if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
+                const bool written = std::fwrite(download.body, 1, download.len, file) == download.len;
+                const bool closed = std::fclose(file) == 0;
+                if (written && closed && std::rename(temporary.c_str(), path.c_str()) == 0)
+                    saved = download.len;
+                else
+                    std::remove(temporary.c_str());
+            }
+        }
+        log_printf("Depot %u manifest CDN HTTP %ld, saved %zu bytes\n", depot, download.status, saved);
+        net_response_free(&download);
+    }
+    if (!attempts) log_printf("No supported Steam manifest CDN found\n");
+    std::free(response);
+    return saved;
 }
 
 static void show_steam_library(PadState& pad, const SteamSession& session) {
@@ -175,6 +231,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                     uint64_t manifest = 0;
                     const uint32_t appid = appids[selected];
                     const size_t manifests = log_public_manifests(appid, metadata, bytes, depot, manifest);
+                    size_t saved = 0;
                     if (depot && manifest) {
                         PbBuf request{};
                         pb_varint(&request, 1, appid);
@@ -192,8 +249,9 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                                    appid, depot, authorized ? "received" : "unavailable", result);
                         std::free(reply);
                         pb_free(&request);
+                        if (authorized) saved = fetch_manifest(cm, depot, manifest, code);
                     }
-                    std::snprintf(status, sizeof(status), "App %u: %zu public depot manifests", appids[selected], manifests);
+                    std::snprintf(status, sizeof(status), "App %u: %zu public depot manifests, %zu bytes saved", appids[selected], manifests, saved);
                 }
                 else
                     std::snprintf(status, sizeof(status), "App %u: metadata unavailable", appids[selected]);
