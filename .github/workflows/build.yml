@@ -10,6 +10,15 @@ permissions:
   contents: read
 
 jobs:
+  manifest-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test depot parser and malformed input rejection
+        run: |
+          gcc -c source/steam/pb.c -o /tmp/pb.o
+          g++ -std=c++17 -Wall -Wextra -Werror -Isource/steam tests/depot_manifest_test.cpp source/steam/depot_manifest.cpp /tmp/pb.o -lz -o /tmp/depot-test
+          /tmp/depot-test
   build:
     runs-on: ubuntu-latest
     container:
@@ -55,6 +64,9 @@ jobs:
           test -f "$DEVKITPRO/libnx/switch_rules"
           echo "libnx: OK"
           if [ -n "${PORTLIBS:-}" ]; then echo "PORTLIBS=$PORTLIBS"; fi
+
+      - name: Install HTTPS dependency
+        run: dkp-pacman -S --noconfirm --needed switch-curl switch-liblzma switch-libzstd
 
       - name: Build
         shell: bash
