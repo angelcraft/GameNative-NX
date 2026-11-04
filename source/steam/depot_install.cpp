@@ -63,8 +63,12 @@ static bool write_depot_file(FILE* output, DepotFile& file, const std::string& c
         ciphertext.resize(part.chunk.compressed);
         const bool read = std::fread(ciphertext.data(), 1, ciphertext.size(), input) == ciphertext.size();
         std::fclose(input);
-        if (!read || !decode_depot_chunk(part.chunk, key, ciphertext.data(), ciphertext.size(), decoded))
+        if (!read) return false;
+        if (!decode_depot_chunk(part.chunk, key, ciphertext.data(), ciphertext.size(), decoded)) {
+            if (std::remove(path.c_str()) == 0)
+                log_printf("Removed invalid cached chunk %s; next attempt will fetch it\n", part.chunk.sha.c_str());
             return false;
+        }
         if (std::fwrite(decoded.data(), 1, decoded.size(), output) != decoded.size()) return false;
         sha1ContextUpdate(&sha, decoded.data(), decoded.size());
         written += decoded.size();

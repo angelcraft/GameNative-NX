@@ -103,20 +103,12 @@ static bool download_depot_chunks(const std::string& host, uint32_t depot, uint6
         struct stat info{};
         const bool existing = stat(path.c_str(), &info) == 0 &&
             static_cast<uint64_t>(info.st_size) == chunk.compressed;
-        if (existing && !key) { ++cached; continue; }
-        std::vector<uint8_t> ciphertext, decoded;
-        if (existing && key && chunk.compressed <= 4*1024*1024) {
-            if (FILE* file = std::fopen(path.c_str(), "rb")) {
-                ciphertext.resize(chunk.compressed);
-                const bool read = std::fread(ciphertext.data(), 1, ciphertext.size(), file) == ciphertext.size();
-                std::fclose(file);
-                if (read && decode_depot_chunk(chunk, key, ciphertext.data(), ciphertext.size(), decoded)) {
-                    ++cached;
-                    ++verified;
-                    continue;
-                }
-            }
+        if (existing) {
+            ++cached;
+            consecutive_decode_failures = 0;
+            continue; // The assembler verifies cached content before publishing files.
         }
+        std::vector<uint8_t> decoded;
         consoleClear();
         std::printf("Downloading Steam depot %u\n%zu files | %zu unique chunks\nChunk %zu/%zu | cached %zu | downloaded %zu\nB Cancel (after current request)\n\nCaching Steam content; installation pending.\n", depot, plan.files, plan.chunks.size(), i+1, plan.chunks.size(), cached, downloaded);
         consoleUpdate(nullptr);
@@ -149,7 +141,7 @@ static bool download_depot_chunks(const std::string& host, uint32_t depot, uint6
     }
     net_download_close(connection);
     log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d verified=%zu\n", depot, downloaded, cached, failed, cancelled, verified);
-    return key && !failed && !cancelled && verified == plan.chunks.size() &&
+    return key && !failed && !cancelled && verified + cached == plan.chunks.size() &&
         assemble_depot(depot, manifest, plan, key, folder, pad);
 }
 
