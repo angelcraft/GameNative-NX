@@ -9,10 +9,17 @@ static uint32_t le32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1])<
 static unsigned le16(const uint8_t* p) { return p[0] | unsigned(p[1])<<8; }
 bool inflate_depot_zip(const void* zip, size_t length, size_t limit, std::vector<uint8_t>& data) {
     const auto* z = static_cast<const uint8_t*>(zip);
-    if (length < 30 || le32(z) != 0x04034b50 || le16(z+6) != 0 || le16(z+8) != 8) return false;
+    if (length < 30 || le32(z) != 0x04034b50 || le16(z+6) != 0) return false;
     const size_t start = 30 + le16(z+26) + le16(z+28);
     const uint32_t packed = le32(z+18), unpacked = le32(z+22);
     if (start > length || packed > length-start || !unpacked || unpacked > limit) return false;
+    const unsigned method = le16(z+8);
+    if (method == 0) {
+        if (packed != unpacked) return false;
+        data.assign(z+start, z+start+packed);
+        return crc32(0, data.data(), unpacked) == le32(z+14);
+    }
+    if (method != 8) return false;
     data.resize(unpacked);
     z_stream stream{};
     stream.next_in = const_cast<Bytef*>(z+start); stream.avail_in = packed;

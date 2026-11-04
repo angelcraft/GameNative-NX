@@ -15,3 +15,7 @@ The GitHub Actions build fetches libsolder from its upstream repository at build
 This repository does not redistribute the GameNative APK, game files, or the large runtime binaries extracted from the user's APK. Runtime binaries used for local testing should be obtained by the user from sources for which the user has the right to use them.
 
 Steam authentication/network/JSON adapted from Rimsoo/SaveSync, commit bba5f39146ca66e954dfc29c2d5effa893d798a7, GPL-3.0. Full license in third_party/SaveSync-LICENSE. QR encoder by Project Nayuki retains its MIT license in source/steam/qrcodegen.*.
+
+The Steam depot decoder follows GameNative's GPL-3.0 depot_chunk.rs at
+https://github.com/utkarshdalal/GameNative/tree/a2a121bb477070026fed8f6ee66f8d3e8b350971/app/src/main/cpp/gn-download/rust/src/store_dl/steam
+and uses libnx AES, XZ Utils liblzma, Zstandard, and zlib.

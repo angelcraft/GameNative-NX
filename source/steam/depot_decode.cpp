@@ -38,7 +38,9 @@ bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
 
     output.resize(chunk.original);
     if (length > 8 && std::memcmp(data, "VSZa", 4) == 0) {
-        if (ZSTD_decompress(output.data(), output.size(), data+8, length-8) != output.size())
+        const size_t frame = ZSTD_findFrameCompressedSize(data+8, length-8);
+        if (ZSTD_isError(frame) ||
+            ZSTD_decompress(output.data(), output.size(), data+8, frame) != output.size())
             return false;
     } else if (length >= 22 && std::memcmp(data, "VZa", 3) == 0) {
         if (data[length-2] != 'z' || data[length-1] != 'v') return false;
