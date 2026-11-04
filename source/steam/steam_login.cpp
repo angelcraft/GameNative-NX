@@ -73,6 +73,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
             }
         }
     }
+    if (tls_ready) cm_close(&cm);
     if (!loaded) log_printf("Steam library request failed\n");
 
     constexpr size_t page_size = 12;
@@ -113,7 +114,9 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                 std::puts("Requesting Steam product metadata...");
                 consoleUpdate(nullptr);
                 size_t bytes = 0;
-                const bool ok = cm_app_info_size(&cm, appids[selected], &bytes);
+                const bool ok = cm_connect(&cm) && cm_logon(&cm, &session) &&
+                    cm_app_info_size(&cm, appids[selected], &bytes);
+                cm_close(&cm);
                 if (ok)
                     std::snprintf(status, sizeof(status), "App %u: %zu metadata bytes received", appids[selected], bytes);
                 else
@@ -124,10 +127,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
         }
         svcSleepThread(16000000);
     }
-    if (tls_ready) {
-        cm_close(&cm);
-        tls_exit();
-    }
+    if (tls_ready) tls_exit();
 }
 
 void run_steam_login(PadState& pad) {
