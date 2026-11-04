@@ -93,6 +93,7 @@ static bool download_depot_chunks(const std::string& host, uint32_t depot, uint6
     PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
     size_t downloaded = 0, cached = 0, failed = 0, verified = 0;
     unsigned consecutive_decode_failures = 0;
+    void* connection = net_download_open();
     bool cancelled = false;
     for (size_t i = 0; i < plan.chunks.size(); ++i) {
         padUpdate(&pad);
@@ -122,7 +123,7 @@ static bool download_depot_chunks(const std::string& host, uint32_t depot, uint6
         const std::string url = "https://" + host + "/depot/" + std::to_string(depot) + "/chunk/" + chunk.sha;
         NetResponse response{};
         bool saved = false;
-        if (net_get(url.c_str(), &response) && response.status == 200 && response.len == chunk.compressed) {
+        if (net_download_get(connection, url.c_str(), &response) && response.status == 200 && response.len == chunk.compressed) {
             if (key && !decode_depot_chunk(chunk, key, response.body, response.len, decoded)) {
                 log_printf("Depot %u chunk %zu: decrypt/decompress/integrity validation failed\n", depot, i+1);
                 net_response_free(&response);
@@ -141,10 +142,12 @@ static bool download_depot_chunks(const std::string& host, uint32_t depot, uint6
             }
         }
         if (saved) ++downloaded; else ++failed;
-        log_printf("Depot %u chunk %zu/%zu HTTP %ld bytes %zu/%u saved=%d\n", depot, i+1, plan.chunks.size(), response.status, response.len, chunk.compressed, saved);
+        if (!saved || downloaded % 64 == 0)
+            log_printf("Depot %u chunk %zu/%zu HTTP %ld bytes %zu/%u saved=%d\n", depot, i+1, plan.chunks.size(), response.status, response.len, chunk.compressed, saved);
         net_response_free(&response);
         if (!saved) break; // Retrying A resumes completed cache entries.
     }
+    net_download_close(connection);
     log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d verified=%zu\n", depot, downloaded, cached, failed, cancelled, verified);
     return key && !failed && !cancelled && verified == plan.chunks.size() &&
         assemble_depot(depot, manifest, plan, key, folder, pad);

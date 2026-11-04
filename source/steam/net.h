@@ -29,3 +29,8 @@ void net_response_free(NetResponse *resp);
 
 // Encode une valeur pour un formulaire. Résultat à libérer avec free().
 char *net_escape(const char *value);
+
+// A sequential download queue can retain its CDN connection between requests.
+void *net_download_open(void);
+void net_download_close(void *connection);
+bool net_download_get(void *connection, const char *url, NetResponse *out);

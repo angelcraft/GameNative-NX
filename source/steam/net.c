@@ -60,12 +60,12 @@ static size_t on_header(char *data, size_t size, size_t nmemb, void *user)
 // method == NULL : GET, ou POST si body est fourni. body est envoyé tel quel (binaire possible).
 // headers : tableau "Nom: valeur" terminé par NULL (optionnel).
 static bool request(const char *method, const char *url, const void *body, size_t body_len,
-                    const char *const *headers, NetResponse *out)
+                    const char *const *headers, NetResponse *out, CURL *connection)
 {
     memset(out, 0, sizeof(*out));
     out->eresult = -1;
 
-    CURL *curl = curl_easy_init();
+    CURL *curl = connection ? connection : curl_easy_init();
     if (!curl)
         return false;
 
@@ -97,7 +97,8 @@ static bool request(const char *method, const char *url, const void *body, size_
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out->status);
     else
         log_printf("curl : %s\n", curl_easy_strerror(rc));
-    curl_easy_cleanup(curl);
+    if (connection) curl_easy_reset(curl);
+    else curl_easy_cleanup(curl);
     curl_slist_free_all(list);
 
     if (!out->body)
@@ -107,23 +108,23 @@ static bool request(const char *method, const char *url, const void *body, size_
 
 bool net_post_form(const char *url, const char *form, NetResponse *out)
 {
-    return request(NULL, url, form, strlen(form), NULL, out);
+    return request(NULL, url, form, strlen(form), NULL, out, NULL);
 }
 
 bool net_get(const char *url, NetResponse *out)
 {
-    return request(NULL, url, NULL, 0, NULL, out);
+    return request(NULL, url, NULL, 0, NULL, out, NULL);
 }
 
 bool net_get_with_headers(const char *url, const char *const *headers, NetResponse *out)
 {
-    return request(NULL, url, NULL, 0, headers, out);
+    return request(NULL, url, NULL, 0, headers, out, NULL);
 }
 
 bool net_send(const char *method, const char *url, const void *body, size_t body_len,
               const char *const *headers, NetResponse *out)
 {
-    return request(method, url, body, body_len, headers, out);
+    return request(method, url, body, body_len, headers, out, NULL);
 }
 
 void net_response_free(NetResponse *resp)
@@ -138,4 +139,11 @@ char *net_escape(const char *value)
     char *copy = tmp ? strdup(tmp) : NULL;
     curl_free(tmp);
     return copy;
+}
+
+void *net_download_open(void) { return curl_easy_init(); }
+void net_download_close(void *connection) { if (connection) curl_easy_cleanup(connection); }
+bool net_download_get(void *connection, const char *url, NetResponse *out)
+{
+    return request(NULL, url, NULL, 0, NULL, out, connection);
 }
