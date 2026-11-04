@@ -88,6 +88,7 @@ static void download_depot_chunks(const std::string& host, uint32_t depot, const
     mkdir(folder.c_str(), 0777);
     PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
     size_t downloaded = 0, cached = 0, failed = 0, verified = 0;
+    unsigned consecutive_decode_failures = 0;
     bool cancelled = false;
     for (size_t i = 0; i < plan.chunks.size(); ++i) {
         padUpdate(&pad);
@@ -122,8 +123,10 @@ static void download_depot_chunks(const std::string& host, uint32_t depot, const
                 log_printf("Depot %u chunk %zu: decrypt/decompress/integrity validation failed\n", depot, i+1);
                 net_response_free(&response);
                 ++failed;
-                break;
+                if (++consecutive_decode_failures >= 4) break;
+                continue;
             }
+            consecutive_decode_failures = 0;
             if (key) ++verified;
             const std::string temporary = path + ".tmp";
             if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
@@ -136,7 +139,7 @@ static void download_depot_chunks(const std::string& host, uint32_t depot, const
         if (saved) ++downloaded; else ++failed;
         log_printf("Depot %u chunk %zu/%zu HTTP %ld bytes %zu/%u saved=%d\n", depot, i+1, plan.chunks.size(), response.status, response.len, chunk.compressed, saved);
         net_response_free(&response);
-        if (failed) break; // Retrying A resumes completed cache entries.
+        if (!saved) break; // Retrying A resumes completed cache entries.
     }
     log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d verified=%zu\n", depot, downloaded, cached, failed, cancelled, verified);
 }

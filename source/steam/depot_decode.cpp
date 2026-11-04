@@ -4,6 +4,9 @@
 #include <zstd.h>
 #include <zlib.h>
 #include <cstring>
+extern "C" {
+#include "log.h"
+}
 
 static bool valid_chunk(const DepotChunk& chunk, const std::vector<uint8_t>& bytes) {
     return bytes.size() == chunk.original &&
@@ -13,7 +16,12 @@ static bool valid_chunk(const DepotChunk& chunk, const std::vector<uint8_t>& byt
 // Port of GameNative gn-download's depot_chunk.rs to libnx and Switch portlibs.
 bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
                         const void* encrypted, size_t size, std::vector<uint8_t>& output) {
-    if (size < 32 || size % 16 || chunk.original > 4*1024*1024) return false;
+    const auto fail = [&](const char* stage) {
+        log_printf("Steam chunk %s failed: %s (encrypted=%zu expected=%u)\n",
+                   chunk.sha.c_str(), stage, size, chunk.original);
+        return false;
+    };
+    if (size < 32 || size % 16 || chunk.original > 4*1024*1024) return fail("envelope size");
     const auto* input = static_cast<const uint8_t*>(encrypted);
     Aes256Context aes;
     aes256ContextCreate(&aes, key, false);
@@ -29,9 +37,9 @@ bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
     for (size_t i = 0; i < sizeof(aes); ++i)
         reinterpret_cast<volatile uint8_t*>(&aes)[i] = 0;
     const size_t padding = plain.back();
-    if (!padding || padding > 16) return false;
+    if (!padding || padding > 16) return fail("AES padding");
     for (size_t i = 0; i < padding; ++i)
-        if (plain[plain.size()-1-i] != padding) return false;
+        if (plain[plain.size()-1-i] != padding) return fail("AES padding bytes");
     plain.resize(plain.size()-padding);
     const auto* data = plain.data();
     const size_t length = plain.size();
@@ -41,11 +49,11 @@ bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
         const size_t frame = ZSTD_findFrameCompressedSize(data+8, length-8);
         if (ZSTD_isError(frame) ||
             ZSTD_decompress(output.data(), output.size(), data+8, frame) != output.size())
-            return false;
+            return fail("Zstandard frame");
     } else if (length >= 22 && std::memcmp(data, "VZa", 3) == 0) {
-        if (data[length-2] != 'z' || data[length-1] != 'v') return false;
+        if (data[length-2] != 'z' || data[length-1] != 'v') return fail("VZip footer");
         lzma_filter filters[] = {{LZMA_FILTER_LZMA1EXT, nullptr}, {LZMA_VLI_UNKNOWN, nullptr}};
-        if (lzma_properties_decode(&filters[0], nullptr, data+7, 5) != LZMA_OK) return false;
+        if (lzma_properties_decode(&filters[0], nullptr, data+7, 5) != LZMA_OK) return fail("VZip properties");
         auto* options = static_cast<lzma_options_lzma*>(filters[0].options);
         options->ext_flags = LZMA_LZMA1EXT_ALLOW_EOPM;
         lzma_set_ext_size((*options), chunk.original);
@@ -55,9 +63,12 @@ bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
                                    output.data(), &output_pos, output.size()) == LZMA_OK &&
             output_pos == output.size();
         lzma_filters_free(filters, nullptr);
-        if (!ok) return false;
-    } else if (!inflate_depot_zip(data, length, chunk.original, output)) {
-        return false;
+        if (!ok) return fail("VZip LZMA decode");
+    } else if (length >= 4 && std::memcmp(data, "PK\x03\x04", 4) == 0) {
+        if (!inflate_depot_zip(data, length, chunk.original, output))
+            return fail("ZIP decode");
+    } else {
+        return fail("unsupported compression");
     }
-    return valid_chunk(chunk, output);
+    return valid_chunk(chunk, output) || fail("decoded size or Adler32");
 }
