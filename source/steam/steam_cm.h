@@ -27,3 +27,5 @@ void cm_close(SteamCM *cm);
 // Appelle une méthode de service, ex. "Cloud.EnumerateUserFiles#1".
 // Retourne l'eresult Steam (1 = OK) ou CM_TRANSPORT_ERROR. Si OK, *resp est alloué (à libérer).
 int cm_call(SteamCM *cm, const char *method, const PbBuf *body, uint8_t **resp, size_t *resp_len);
+
+bool cm_app_info_size(SteamCM *cm, uint32_t appid, size_t *size);

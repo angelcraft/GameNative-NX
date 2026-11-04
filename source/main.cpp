@@ -3853,6 +3853,12 @@ void runtime_probe_leaf_module(std::string& result) {
         reinterpret_cast<void*>(native_create));
     append_log(exec_line);
     append_log("RUNTIME PROBE V35: ENTER");
+    const auto* entry_words = static_cast<const uint32_t*>(native_create);
+    uint64_t thread_pointer = 0;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(thread_pointer));
+    vortek_trace("TPIDR_EL0=%016llx", static_cast<unsigned long long>(thread_pointer));
+    for (unsigned i = 0; i < 16; ++i)
+        vortek_trace("createVkContext+0x%02x instruction=%08x", i * 4, entry_words[i]);
     vortek_trace("enter native createVkContext");
 
     const int fault_fd = ::open(kLog, O_WRONLY | O_APPEND);

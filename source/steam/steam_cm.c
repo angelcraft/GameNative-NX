@@ -328,3 +328,39 @@ int cm_call(SteamCM *cm, const char *method, const PbBuf *body, uint8_t **resp, 
     wait_free(&w);
     return eresult;
 }
+
+bool cm_app_info_size(SteamCM *cm, uint32_t appid, size_t *size)
+{
+    // Steam PICS product info, one app per request.
+    PbBuf app = {0}, request = {0};
+    pb_varint(&app, 1, appid);
+    pb_bytes(&request, 2, app.data, app.len);
+    pb_varint(&request, 7, 1);
+    uint64_t job = cm->next_job++;
+    keepalive(cm);
+    bool sent = !app.error && !request.error && cm_send(cm, 8903, &request, job, NULL);
+    pb_free(&app);
+    pb_free(&request);
+    if (!sent)
+        return false;
+
+    CmWait response = {.emsg = 8904, .job = job};
+    bool ok = false;
+    if (cm_wait(cm, &response)) {
+        PbReader reader;
+        PbField field;
+        pb_reader(&reader, response.body, response.body_len);
+        while (pb_next(&reader, &field)) {
+            uint64_t returned_id = 0;
+            const uint8_t *metadata;
+            if (field.field == 1 && field.wire == PB_BYTES &&
+                pb_get_u64(field.data, field.len, 1, &returned_id) && returned_id == appid &&
+                pb_get_bytes(field.data, field.len, 5, &metadata, size) && *size > 0) {
+                ok = true;
+                break;
+            }
+        }
+    }
+    wait_free(&response);
+    return ok;
+}

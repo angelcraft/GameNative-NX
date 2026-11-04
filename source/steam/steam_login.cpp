@@ -31,9 +31,11 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
     consoleUpdate(nullptr);
 
     std::vector<std::string> games;
+    std::vector<uint32_t> appids;
+    SteamCM cm{};
+    const bool tls_ready = tls_init();
     bool loaded = false;
-    if (tls_init()) {
-        SteamCM cm{};
+    if (tls_ready) {
         if (cm_connect(&cm)) {
             if (cm_logon(&cm, &session)) {
                 log_printf("Steam CM logon accepted\n");
@@ -61,46 +63,70 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                             for (char* c = name; *c; ++c)
                                 if (static_cast<unsigned char>(*c) < 32 || *c == 127) *c = ' ';
                         }
+                        if (id > UINT32_MAX) continue;
+                        appids.push_back(static_cast<uint32_t>(id));
                         games.push_back(std::to_string(id) + "  " + name);
                     }
                     log_printf("Steam library returned %zu entries\n", games.size());
                 }
                 std::free(response);
             }
-            cm_close(&cm);
         }
-        tls_exit();
     }
     if (!loaded) log_printf("Steam library request failed\n");
 
     constexpr size_t page_size = 12;
-    size_t start = 0;
+    size_t selected = 0;
+    char status[128]{};
     bool redraw = true;
     while (appletMainLoop()) {
         if (redraw) {
             consoleClear();
             if (loaded) {
                 std::printf("Steam account library | %zu entries\n\n", games.size());
+                const size_t start = selected / page_size * page_size;
                 for (size_t i = start; i < games.size() && i < start + page_size; ++i)
-                    std::printf("%.100s\n", games[i].c_str());
+                    std::printf("%c %.100s\n", i == selected ? '>' : ' ', games[i].c_str());
             } else {
                 std::puts("Could not load Steam library. See logs/steam-auth.log.");
             }
-            std::puts("\nLeft/Right Page | B Back");
+            std::printf("\nUp/Down Select | Left/Right Page | A Check product info | B Back\n%s\n", status);
             consoleUpdate(nullptr);
             redraw = false;
         }
         padUpdate(&pad);
         const u64 buttons = padGetButtonsDown(&pad);
         if (buttons & HidNpadButton_B) break;
-        if ((buttons & HidNpadButton_AnyRight) && start + page_size < games.size()) {
-            start += page_size;
-            redraw = true;
-        } else if ((buttons & HidNpadButton_AnyLeft) && start >= page_size) {
-            start -= page_size;
-            redraw = true;
+        if (loaded && !appids.empty()) {
+            const size_t before = selected;
+            if ((buttons & HidNpadButton_AnyDown) && selected + 1 < appids.size()) ++selected;
+            if ((buttons & HidNpadButton_AnyUp) && selected > 0) --selected;
+            if ((buttons & HidNpadButton_AnyRight) && selected + page_size < appids.size())
+                selected += page_size;
+            if ((buttons & HidNpadButton_AnyLeft) && selected >= page_size) selected -= page_size;
+            if (selected != before) {
+                status[0] = '\0';
+                redraw = true;
+            }
+            if (buttons & HidNpadButton_A) {
+                consoleClear();
+                std::puts("Requesting Steam product metadata...");
+                consoleUpdate(nullptr);
+                size_t bytes = 0;
+                const bool ok = cm_app_info_size(&cm, appids[selected], &bytes);
+                if (ok)
+                    std::snprintf(status, sizeof(status), "App %u: %zu metadata bytes received", appids[selected], bytes);
+                else
+                    std::snprintf(status, sizeof(status), "App %u: metadata unavailable", appids[selected]);
+                log_printf("%s\n", status);
+                redraw = true;
+            }
         }
         svcSleepThread(16000000);
+    }
+    if (tls_ready) {
+        cm_close(&cm);
+        tls_exit();
     }
 }
 
