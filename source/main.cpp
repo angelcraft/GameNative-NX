@@ -19,6 +19,31 @@
 #include <unistd.h>
 
 namespace {
+int g_vortek_fault_fd = -1;
+}
+
+extern "C" {
+alignas(16) u8 __nx_exception_stack[0x4000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+
+void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+    const int fd = __atomic_exchange_n(&g_vortek_fault_fd, -1, __ATOMIC_RELAXED);
+    if (fd < 0)
+        return;
+
+    // Format without stdio or allocation while handling the fault.
+    char line[] = "V35 exception desc=0000000000000000 pc=0000000000000000 lr=0000000000000000 far=0000000000000000 esr=0000000000000000\n";
+    const u64 values[] = {ctx->error_desc, ctx->pc.x, ctx->lr.x, ctx->far.x, ctx->esr};
+    const size_t offsets[] = {19, 39, 59, 80, 101};
+    for (size_t i = 0; i < 5; ++i) {
+        for (size_t digit = 0; digit < 16; ++digit)
+            line[offsets[i] + digit] = "0123456789abcdef"[(values[i] >> (60 - 4 * digit)) & 15];
+    }
+    (void)::write(fd, line, sizeof(line) - 1);
+}
+}
+
+namespace {
 
 // No-op constructor target used by solder_hook_offset() during diagnosis.
 // Keep C linkage-free and plain void() so it can replace a .init_array entry.
@@ -3829,12 +3854,18 @@ void runtime_probe_leaf_module(std::string& result) {
     append_log("RUNTIME PROBE V35: ENTER");
     vortek_trace("enter native createVkContext");
 
+    const int fault_fd = ::open(kLog, O_WRONLY | O_APPEND);
+    vortek_trace("exception logging %s", fault_fd >= 0 ? "armed" : "unavailable");
+    __atomic_store_n(&g_vortek_fault_fd, fault_fd, __ATOMIC_RELAXED);
     void* v35_context =
         create_fn(
             fake_jni.env_storage,
             reinterpret_cast<void*>(0x2001),
             -1,
             nullptr);
+    __atomic_store_n(&g_vortek_fault_fd, -1, __ATOMIC_RELAXED);
+    if (fault_fd >= 0)
+        ::close(fault_fd);
 
     std::snprintf(
         exec_line, sizeof(exec_line),
