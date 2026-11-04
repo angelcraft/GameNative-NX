@@ -4063,11 +4063,8 @@ int main(int /*argc*/, char** /*argv*/) {
         draw_header();
 
         std::printf(
-            "RUNTIME PROBE\n\n"
-            "This pass preloads all ARM64 .so and then forces one leaf module:\n"
-            "  SOLDER_LAZY | SOLDER_NO_AUTOLOAD\n\n"
-            "V35 invokes native createVkContext with a minimal JNI table.\n"
-            "This experiment may stop responding.\n\n"
+            "Steam library from local app manifests\n"
+            "V35 diagnostic probe available separately\n\n"
         );
 
         std::printf(

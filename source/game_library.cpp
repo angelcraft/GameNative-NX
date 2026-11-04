@@ -131,6 +131,8 @@ void run_game_library(PadState& pad, const char* root) {
     bool details = false;
     bool show_logs = false;
     std::string status;
+    std::string runtime = "Wine";
+    std::string log_view;
     while (appletMainLoop()) {
         consoleClear();
         std::printf("GameNative NX | Steam\n\n");
@@ -138,17 +140,8 @@ void run_game_library(PadState& pad, const char* root) {
         const std::string game_log = game ? logs + "/steam-" + game->app_id + ".log" : "";
         const std::string config = game ? library + "/" + game->app_id + ".runtime" : "";
         if (show_logs) {
-            std::printf("Session log\n%s", read_log(session).c_str());
-            if (details)
-                std::printf("\nGame log\n%s", read_log(game_log).c_str());
-            std::printf("\nB Back\n");
+            std::printf("%s\nB Back\n", log_view.c_str());
         } else if (details && game) {
-            std::string runtime = "Wine";
-            std::ifstream preferences(config);
-            for (std::string line; std::getline(preferences, line);) {
-                if (line == "Wine" || line == "Proton")
-                    runtime = line;
-            }
             std::printf("%.64s | Steam App %s\n\nRuntime preference: %s\n",
                         game->name.c_str(), game->app_id.c_str(), runtime.c_str());
             std::printf("Download and Play require Steam sign-in and a Horizon runtime.\n\n");
@@ -170,17 +163,17 @@ void run_game_library(PadState& pad, const char* root) {
             else if (details) details = false;
             else break;
         } else if (!show_logs && (buttons & HidNpadButton_Y)) {
+            log_view = "Session log\n" + read_log(session);
+            if (details)
+                log_view += "\nGame log\n" + read_log(game_log);
             show_logs = true;
         } else if (details && !show_logs && game && (buttons & HidNpadButton_A)) {
-            std::ifstream preferences(config);
-            std::string runtime = "Wine";
-            for (std::string line; std::getline(preferences, line);) {
-                if (line == "Wine" || line == "Proton")
-                    runtime = line;
-            }
+            const std::string next_runtime = runtime == "Wine" ? "Proton" : "Wine";
             std::ofstream output(config, std::ios::app);
-            output << '\n' << (runtime == "Wine" ? "Proton" : "Wine") << '\n';
+            output << '\n' << next_runtime << '\n';
             output.close();
+            if (output)
+                runtime = next_runtime;
             status = output ? "Preference saved" : "Failed to save preference";
             log_event(game_log, status.c_str());
         } else if (!details && !show_logs) {
@@ -191,6 +184,12 @@ void run_game_library(PadState& pad, const char* root) {
             } else if (game && (buttons & HidNpadButton_A)) {
                 details = true;
                 status.clear();
+                runtime = "Wine";
+                std::ifstream preferences(config);
+                for (std::string line; std::getline(preferences, line);) {
+                    if (line == "Wine" || line == "Proton")
+                        runtime = line;
+                }
                 log_event(game_log, "Game settings opened");
             } else if (selected > 0 && (buttons & HidNpadButton_AnyUp)) {
                 --selected;
