@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include <cerrno>
 #include "depot_manifest.h"
 
 extern "C" {
@@ -162,9 +163,24 @@ static size_t fetch_manifest(SteamCM& cm, uint32_t appid, uint32_t depot, uint64
     PbReader reader;
     PbField field;
     pb_reader(&reader, response, length);
-    size_t saved = 0;
+    const std::string folder = "sdmc:/switch/gamenative_nx/manifests";
+    const std::string path = folder + "/" + std::to_string(depot) +
+        "_" + std::to_string(manifest) + ".zip";
+    DepotPlan plan;
+    size_t usable = 0;
+    struct stat info{};
+    if (stat(path.c_str(), &info) == 0 && info.st_size > 0 && info.st_size <= 4*1024*1024) {
+        if (FILE* file = std::fopen(path.c_str(), "rb")) {
+            std::vector<uint8_t> cached(info.st_size);
+            const bool read = std::fread(cached.data(), 1, cached.size(), file) == cached.size();
+            std::fclose(file);
+            if (read && read_depot_manifest(cached.data(), cached.size(), depot, manifest, plan))
+                usable = cached.size();
+        }
+    }
+    if (usable) log_printf("Depot %u reused validated manifest from SD (%zu bytes)\n", depot, usable);
     unsigned attempts = 0;
-    while (attempts < 3 && !saved && pb_next(&reader, &field)) {
+    while (attempts < 3 && pb_next(&reader, &field)) {
         if (field.field != 1 || field.wire != PB_BYTES) continue;
         char hostname[128]{};
         if (!pb_get_string(field.data, field.len, 9, hostname, sizeof(hostname)) &&
@@ -177,44 +193,41 @@ static size_t fetch_manifest(SteamCM& cm, uint32_t appid, uint32_t depot, uint64
             continue;
         ++attempts;
 
-        const std::string url = "https://" + host + "/depot/" + std::to_string(depot) +
-            "/manifest/" + std::to_string(manifest) + "/5/" + std::to_string(code);
-        NetResponse download{};
-        if (net_get(url.c_str(), &download) && download.status == 200 &&
-            download.len >= 4 && std::memcmp(download.body, "PK\x03\x04", 4) == 0) {
-            constexpr const char* folder = "sdmc:/switch/gamenative_nx/manifests";
-            mkdir(folder, 0777);
-            const std::string path = std::string(folder) + "/" + std::to_string(depot) +
-                "_" + std::to_string(manifest) + ".zip";
-            const std::string temporary = path + ".tmp";
-            if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
-                const bool written = std::fwrite(download.body, 1, download.len, file) == download.len;
-                const bool closed = std::fclose(file) == 0;
-                if (written && closed && std::rename(temporary.c_str(), path.c_str()) == 0)
-                    saved = download.len;
-                else
+        if (!usable) {
+            const std::string url = "https://" + host + "/depot/" + std::to_string(depot) +
+                "/manifest/" + std::to_string(manifest) + "/5/" + std::to_string(code);
+            NetResponse download{};
+            if (net_get(url.c_str(), &download) && download.status == 200 &&
+                read_depot_manifest(download.body, download.len, depot, manifest, plan)) {
+                usable = download.len;
+                mkdir(folder.c_str(), 0777);
+                const std::string temporary = path + ".tmp";
+                bool saved = false;
+                if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
+                    const bool written = std::fwrite(download.body, 1, download.len, file) == download.len;
+                    const bool closed = std::fclose(file) == 0;
+                    saved = written && closed && std::rename(temporary.c_str(), path.c_str()) == 0;
+                }
+                if (!saved) {
+                    log_printf("Depot %u manifest SD write failed (errno %d); using validated bytes in memory\n", depot, errno);
                     std::remove(temporary.c_str());
+                }
             }
+            log_printf("Depot %u manifest CDN HTTP %ld, received %zu bytes, usable %zu\n",
+                       depot, download.status, download.len, usable);
+            net_response_free(&download);
         }
-        if (saved) {
-            DepotPlan plan;
-            if (read_depot_manifest(download.body, download.len, depot, manifest, plan)) {
-                log_printf("Depot %u validated manifest: files=%zu chunks=%zu bytes=%llu encrypted_names=%d\n", depot, plan.files, plan.chunks.size(), static_cast<unsigned long long>(plan.bytes), plan.encrypted_names);
-                uint8_t key[32]{};
-                const bool has_key = cm_depot_key(&cm, appid, depot, key);
-                assembled = download_depot_chunks(host, depot, manifest, plan, has_key ? key : nullptr);
-                for (size_t i = 0; i < sizeof(key); ++i)
-                    static_cast<volatile uint8_t*>(key)[i] = 0;
-            } else {
-                log_printf("Depot %u manifest validation failed; no chunks requested\n", depot);
-            }
-        }
-        log_printf("Depot %u manifest CDN HTTP %ld, saved %zu bytes\n", depot, download.status, saved);
-        net_response_free(&download);
+        if (!usable) continue;
+        uint8_t key[32]{};
+        const bool has_key = cm_depot_key(&cm, appid, depot, key);
+        assembled = download_depot_chunks(host, depot, manifest, plan, has_key ? key : nullptr);
+        for (size_t i = 0; i < sizeof(key); ++i)
+            static_cast<volatile uint8_t*>(key)[i] = 0;
+        break;
     }
     if (!attempts) log_printf("No supported Steam manifest CDN found\n");
     std::free(response);
-    return saved;
+    return usable;
 }
 
 static void show_steam_library(PadState& pad, const SteamSession& session) {
