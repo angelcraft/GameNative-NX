@@ -2,7 +2,9 @@
 #include <solder.h>
 #include "android_compat.hpp"
 
+#include <cstdarg>
 #include <cstdio>
+#include <ctime>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
@@ -15,6 +17,31 @@
 #include <algorithm>
 #include <sys/socket.h>
 #include <unistd.h>
+
+namespace {
+int g_vortek_fault_fd = -1;
+}
+
+extern "C" {
+alignas(16) u8 __nx_exception_stack[0x4000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+
+void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+    const int fd = __atomic_exchange_n(&g_vortek_fault_fd, -1, __ATOMIC_RELAXED);
+    if (fd < 0)
+        return;
+
+    // Format without stdio or allocation while handling the fault.
+    char line[] = "V35 exception desc=0000000000000000 pc=0000000000000000 lr=0000000000000000 far=0000000000000000 esr=0000000000000000\n";
+    const u64 values[] = {ctx->error_desc, ctx->pc.x, ctx->lr.x, ctx->far.x, ctx->esr};
+    const size_t offsets[] = {19, 39, 59, 80, 101};
+    for (size_t i = 0; i < 5; ++i) {
+        for (size_t digit = 0; digit < 16; ++digit)
+            line[offsets[i] + digit] = "0123456789abcdef"[(values[i] >> (60 - 4 * digit)) & 15];
+    }
+    (void)::write(fd, line, sizeof(line) - 1);
+}
+}
 
 namespace {
 
@@ -76,6 +103,32 @@ void append_log(const char* message) {
     std::fclose(f);
 }
 
+// Keep foreign-code breadcrumbs bounded even if an import is called in a loop.
+void vortek_trace(const char* format, ...) {
+    static unsigned count = 0;
+    constexpr unsigned kTraceLimit = 96;
+    const unsigned index = __atomic_fetch_add(&count, 1, __ATOMIC_RELAXED);
+    if (index >= kTraceLimit) {
+        if (index == kTraceLimit)
+            append_log("RUNTIME PROBE V35: trace limit reached");
+        return;
+    }
+
+    const int saved_errno = errno;
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    char line[256];
+    const int prefix = std::snprintf(
+        line, sizeof(line), "RUNTIME PROBE V35 [%lld.%03ld] ",
+        static_cast<long long>(now.tv_sec), now.tv_nsec / 1000000L);
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line + prefix, sizeof(line) - prefix, format, args);
+    va_end(args);
+    append_log(line);
+    errno = saved_errno;
+}
+
 void append_logf(const char* fmt, const char* a) {
     FILE* f = std::fopen(kLog, "a");
     if (!f)
@@ -111,32 +164,64 @@ static int g_main_export_count = 0;
 using PthreadCreateProbeFn = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 static PthreadCreateProbeFn g_vortek_probe_original_pthread_create = nullptr;
 static int g_vortek_probe_pthread_create_count = 0;
+static bool g_vortek_probe_started_workers = false;
+
 static int gn_vortek_probe_pthread_create(
     pthread_t* thread,
     const pthread_attr_t* attr,
     void* (*start_routine)(void*),
     void* arg) {
     const int call_index =
-        __atomic_add_fetch(&g_vortek_probe_pthread_create_count, 1, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&g_vortek_probe_pthread_create_count, 1, __ATOMIC_RELAXED);
+    vortek_trace("pthread_create #%d enter start=%p attr=%p",
+                 call_index, reinterpret_cast<void*>(start_routine),
+                 static_cast<const void*>(attr));
 
-    // Upstream ThreadPool_init() creates 8 workers, then setupRingBuffers()
-    // creates the 9th thread for requestHandlerThread. Let the eight workers
-    // use real pthreads so their lifecycle/worker counters remain coherent.
-    if (call_index <= 8 && g_vortek_probe_original_pthread_create) {
-        const int rc =
-            g_vortek_probe_original_pthread_create(thread, attr, start_routine, arg);
-        append_log(("RUNTIME PROBE V35: pthread_create real worker #" +
-                    std::to_string(call_index) + " rc=" +
-                    std::to_string(rc)).c_str());
-        return rc;
+    // Keep the bootstrap guard until the request transport is implemented.
+    // The expected first eight calls create the pool workers.
+    if (call_index > 8) {
+        vortek_trace("pthread_create #%d blocked by probe guard rc=%d", call_index, EAGAIN);
+        return EAGAIN;
     }
 
-    if (thread)
-        std::memset(thread, 0, sizeof(*thread));
+    const int rc = g_vortek_probe_original_pthread_create(thread, attr, start_routine, arg);
+    if (rc == 0)
+        __atomic_store_n(&g_vortek_probe_started_workers, true, __ATOMIC_RELAXED);
+    vortek_trace("pthread_create #%d return rc=%d", call_index, rc);
+    return rc;
+}
 
-    append_log(("RUNTIME PROBE V35: pthread_create suppressed request-handler #" +
-                std::to_string(call_index)).c_str());
-    return 0;
+static int gn_vortek_probe_pthread_detach(pthread_t thread) {
+    vortek_trace("pthread_detach enter");
+    const int rc = thread == pthread_t{} ? ESRCH : gn_android_pthread_detach(thread);
+    vortek_trace("pthread_detach return rc=%d", rc);
+    return rc;
+}
+
+static int gn_vortek_probe_pthread_mutex_init(pthread_mutex_t* mutex,
+                                             const pthread_mutexattr_t* attr) {
+    vortek_trace("pthread_mutex_init enter mutex=%p", static_cast<void*>(mutex));
+    const int rc = gn_android_pthread_mutex_init(mutex, attr);
+    vortek_trace("pthread_mutex_init return rc=%d", rc);
+    return rc;
+}
+
+static int gn_vortek_probe_pthread_cond_init(pthread_cond_t* cond,
+                                            const pthread_condattr_t* attr) {
+    vortek_trace("pthread_cond_init enter cond=%p", static_cast<void*>(cond));
+    const int rc = gn_android_pthread_cond_init(cond, attr);
+    vortek_trace("pthread_cond_init return rc=%d", rc);
+    return rc;
+}
+
+static void* gn_vortek_probe_mmap(void* addr, size_t length, int prot, int flags,
+                                  int fd, int64_t offset) {
+    vortek_trace("mmap enter length=%zu fd=%d flags=%#x", length, fd, flags);
+    void* result = gn_android_mmap(addr, length, prot, flags, fd, offset);
+    // The Android shim returns (void*)-1 on failure. devkitA64 has no sys/mman.h.
+    const bool failed = result == reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+    vortek_trace("mmap return addr=%p errno=%d", result, failed ? errno : 0);
+    return result;
 }
 
 static ssize_t gn_vortek_probe_sendmsg(
@@ -2750,16 +2835,16 @@ void runtime_probe_leaf_module(std::string& result) {
     // solder_dlsym() triggers/uses the target's lazy relocations.
     replace_main_export_addr(
         "pthread_detach",
-        reinterpret_cast<void*>(&gn_android_pthread_detach));
+        reinterpret_cast<void*>(&gn_vortek_probe_pthread_detach));
     replace_main_export_addr(
         "pthread_mutex_init",
-        reinterpret_cast<void*>(&gn_android_pthread_mutex_init));
+        reinterpret_cast<void*>(&gn_vortek_probe_pthread_mutex_init));
     replace_main_export_addr(
         "pthread_cond_init",
-        reinterpret_cast<void*>(&gn_android_pthread_cond_init));
+        reinterpret_cast<void*>(&gn_vortek_probe_pthread_cond_init));
     replace_main_export_addr(
         "mmap",
-        reinterpret_cast<void*>(&gn_android_mmap));
+        reinterpret_cast<void*>(&gn_vortek_probe_mmap));
 
     if (solder_set_main_exports(
             g_main_exports,
@@ -3679,10 +3764,7 @@ void runtime_probe_leaf_module(std::string& result) {
     // Build only the tiny JNI surface that its upstream implementation uses
     // during option translation, then let the real Vortek code run.
     //
-    // Thread creation is temporarily made non-spawning for this bootstrap
-    // test. This avoids both Linux futex waits in requestHandlerThread and
-    // Bionic-vs-newlib pthread object layout differences. Once create returns
-    // successfully we can implement real worker threads as the next step.
+    // This probe allows pool workers and blocks the expected request handler.
     append_log("RUNTIME PROBE V35: EXECUTE exported createVkContext with minimal JNI");
 
     struct GnFakeJni {
@@ -3691,39 +3773,62 @@ void runtime_probe_leaf_module(std::string& result) {
     };
 
     static auto gn_jni_get_object_class =
-        [](void*, void*) -> void* { return reinterpret_cast<void*>(0x1001); };
+        [](void*, void*) -> void* {
+            vortek_trace("JNI GetObjectClass");
+            return reinterpret_cast<void*>(0x1001);
+        };
 
     static auto gn_jni_get_field_id =
-        [](void*, void*, const char*, const char*) -> void* {
+        [](void*, void*, const char* name, const char* signature) -> void* {
+            vortek_trace("JNI GetFieldID name=%.64s signature=%.48s", name, signature);
             return reinterpret_cast<void*>(0x3001);
         };
 
     static auto gn_jni_get_object_field =
-        [](void*, void*, void*) -> void* { return nullptr; };
+        [](void*, void*, void*) -> void* {
+            vortek_trace("JNI GetObjectField");
+            return nullptr;
+        };
 
     static auto gn_jni_get_byte_field =
-        [](void*, void*, void*) -> int8_t { return 0; };
-
-    static auto gn_jni_get_short_field =
-        [](void*, void*, void*) -> int16_t { return 0; };
-
-    static auto gn_jni_get_int_field =
-        [](void*, void*, void*) -> int32_t { return 0; };
-
-    static auto gn_jni_delete_local_ref =
-        [](void*, void*) -> void {};
-
-    static auto gn_jni_new_global_ref =
-        [](void*, void* obj) -> void* { return obj; };
-
-    static auto gn_jni_get_java_vm =
-        [](void*, void** out) -> int32_t {
-            if (out) *out = nullptr;
+        [](void*, void*, void*) -> int8_t {
+            vortek_trace("JNI GetByteField");
             return 0;
         };
 
-    GnFakeJni fake_jni{};
+    static auto gn_jni_get_short_field =
+        [](void*, void*, void*) -> int16_t {
+            vortek_trace("JNI GetShortField");
+            return 0;
+        };
+
+    static auto gn_jni_get_int_field =
+        [](void*, void*, void*) -> int32_t {
+            vortek_trace("JNI GetIntField");
+            return 0;
+        };
+
+    static auto gn_jni_delete_local_ref =
+        [](void*, void*) { vortek_trace("JNI DeleteLocalRef"); };
+    static auto gn_jni_delete_global_ref =
+        [](void*, void*) { vortek_trace("JNI DeleteGlobalRef"); };
+
+    static auto gn_jni_new_global_ref =
+        [](void*, void* obj) -> void* {
+            vortek_trace("JNI NewGlobalRef");
+            return obj;
+        };
+
+    static auto gn_jni_get_java_vm =
+        [](void*, void** out) -> int32_t {
+            vortek_trace("JNI GetJavaVM unavailable");
+            if (out) *out = nullptr;
+            return -1; // JNI_ERR
+        };
+
+    static GnFakeJni fake_jni{};
     fake_jni.table[21]  = reinterpret_cast<void*>(+gn_jni_new_global_ref);   // NewGlobalRef
+    fake_jni.table[22]  = reinterpret_cast<void*>(+gn_jni_delete_global_ref); // DeleteGlobalRef
     fake_jni.table[23]  = reinterpret_cast<void*>(+gn_jni_delete_local_ref); // DeleteLocalRef
     fake_jni.table[31]  = reinterpret_cast<void*>(+gn_jni_get_object_class); // GetObjectClass
     fake_jni.table[94]  = reinterpret_cast<void*>(+gn_jni_get_field_id);     // GetFieldID
@@ -3734,11 +3839,7 @@ void runtime_probe_leaf_module(std::string& result) {
     fake_jni.table[219] = reinterpret_cast<void*>(+gn_jni_get_java_vm);      // GetJavaVM
     fake_jni.env_storage[0] = fake_jni.table;
 
-    // Keep the Vortek pthread bootstrap self-contained for this first run.
-    // Eight ThreadPool workers + one request handler are all suppressed; the
-    // caller still sees successful pthread_create/pthread_detach calls and can
-    // therefore build the VkContext without entering Linux synchronization.
-    g_vortek_probe_pthread_create_count = 0;
+    __atomic_store_n(&g_vortek_probe_pthread_create_count, 0, __ATOMIC_RELAXED);
 
     using GnCreateVkContextFn = void* (*)(void*, void*, int, void*);
     const GnCreateVkContextFn create_fn =
@@ -3751,13 +3852,20 @@ void runtime_probe_leaf_module(std::string& result) {
         reinterpret_cast<void*>(native_create));
     append_log(exec_line);
     append_log("RUNTIME PROBE V35: ENTER");
+    vortek_trace("enter native createVkContext");
 
+    const int fault_fd = ::open(kLog, O_WRONLY | O_APPEND);
+    vortek_trace("exception logging %s", fault_fd >= 0 ? "armed" : "unavailable");
+    __atomic_store_n(&g_vortek_fault_fd, fault_fd, __ATOMIC_RELAXED);
     void* v35_context =
         create_fn(
             fake_jni.env_storage,
             reinterpret_cast<void*>(0x2001),
             -1,
             nullptr);
+    __atomic_store_n(&g_vortek_fault_fd, -1, __ATOMIC_RELAXED);
+    if (fault_fd >= 0)
+        ::close(fault_fd);
 
     std::snprintf(
         exec_line, sizeof(exec_line),
@@ -3769,11 +3877,10 @@ void runtime_probe_leaf_module(std::string& result) {
         append_log("RUNTIME PROBE V35: createVkContext returned NULL");
         append_log("RUNTIME PROBE V35: this is now an implementation failure, not a symbol-discovery failure");
     } else {
-        append_log("RUNTIME PROBE V35: SUCCESS -- Vortek VkContext created");
+        append_log("RUNTIME PROBE V35: returned a context pointer; transport and Vulkan are unverified");
     }
 
     append_log("RUNTIME PROBE V35: bootstrap execution complete");
-    append_log("RUNTIME PROBE V34: refusing execution; callsite analysis only");
     append_log("RUNTIME PROBE: handles intentionally kept alive until process exit");
     return;
 
@@ -3958,8 +4065,8 @@ int main(int /*argc*/, char** /*argv*/) {
             "RUNTIME PROBE\n\n"
             "This pass preloads all ARM64 .so and then forces one leaf module:\n"
             "  SOLDER_LAZY | SOLDER_NO_AUTOLOAD\n\n"
-            "It does NOT call dlsym on arbitrary exports and\n"
-            "does NOT execute JNI functions.\n\n"
+            "V35 invokes native createVkContext with a minimal JNI table.\n"
+            "This experiment may stop responding.\n\n"
         );
 
         std::printf(
@@ -4011,7 +4118,9 @@ int main(int /*argc*/, char** /*argv*/) {
         svcSleepThread(16'000'000ULL);
     }
 
-    if (solder_ok)
+    // V35 cannot join Vortek's pool through the incomplete context lifecycle.
+    // Leave its code mapped until Horizon tears down the process.
+    if (solder_ok && !__atomic_load_n(&g_vortek_probe_started_workers, __ATOMIC_RELAXED))
         solder_quit();
 
     socketExit();
