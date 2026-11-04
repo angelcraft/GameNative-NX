@@ -21,14 +21,14 @@ APP_ICON := $(TOPDIR)/icon.png
 export APP_TITLE APP_AUTHOR APP_VERSION APP_ICON
 
 BUILD := build
-SOURCES := source
+SOURCES := source source/steam
 INCLUDES := source $(SOLDER_DIR)/include
 
 ARCH := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS := -Wall -Wextra -O2 -ffunction-sections $(ARCH) $(INCLUDE) -D__SWITCH__
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) -Wl,--gc-sections
-LIBS := -lsolder -lnx -lm
+LIBS := -lsolder -lcurl -lz -lnx -lm
 LIBDIRS := $(SOLDER_DIR) $(PORTLIBS) $(LIBNX)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))

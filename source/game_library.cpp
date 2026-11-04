@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <vector>
 
+void run_steam_login(PadState& pad);
+
 namespace {
 
 struct Game {
@@ -153,12 +155,14 @@ void run_game_library(PadState& pad, const char* root) {
             for (size_t i = selected / 10 * 10; i < games.size() && i < selected / 10 * 10 + 10; ++i)
                 std::printf("%c %.60s [%s]\n", i == selected ? '>' : ' ',
                             games[i].name.c_str(), games[i].app_id.c_str());
-            std::printf("\nUp/Down Browse | A Configure | X Reload | Y Logs | B Back\n");
+            std::printf("\nUp/Down Browse | A Configure | X Reload | Y Logs | B Back | + Steam login\n");
         }
         consoleUpdate(nullptr);
         padUpdate(&pad);
         const u64 buttons = padGetButtonsDown(&pad);
-        if (buttons & HidNpadButton_B) {
+        if (!details && !show_logs && (buttons & HidNpadButton_Plus)) {
+            run_steam_login(pad);
+        } else if (buttons & HidNpadButton_B) {
             if (show_logs) show_logs = false;
             else if (details) details = false;
             else break;

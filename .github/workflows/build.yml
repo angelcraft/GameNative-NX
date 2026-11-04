@@ -56,6 +56,9 @@ jobs:
           echo "libnx: OK"
           if [ -n "${PORTLIBS:-}" ]; then echo "PORTLIBS=$PORTLIBS"; fi
 
+      - name: Install HTTPS dependency
+        run: dkp-pacman -S --noconfirm --needed switch-curl
+
       - name: Build
         shell: bash
         run: make -j"$(nproc)"
