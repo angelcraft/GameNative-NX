@@ -80,8 +80,11 @@ static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t s
     return count;
 }
 
+bool assemble_depot(uint32_t depot, uint64_t manifest, DepotPlan& plan,
+                    const uint8_t key[32], const std::string& cache, PadState& pad);
+
 // Ciphertext cache is deliberately separate from installed game files.
-static void download_depot_chunks(const std::string& host, uint32_t depot, const DepotPlan& plan, const uint8_t* key) {
+static bool download_depot_chunks(const std::string& host, uint32_t depot, uint64_t manifest, DepotPlan& plan, const uint8_t* key) {
     const std::string root = "sdmc:/switch/gamenative_nx/chunks";
     mkdir(root.c_str(), 0777);
     const std::string folder = root + "/" + std::to_string(depot);
@@ -142,9 +145,11 @@ static void download_depot_chunks(const std::string& host, uint32_t depot, const
         if (!saved) break; // Retrying A resumes completed cache entries.
     }
     log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d verified=%zu\n", depot, downloaded, cached, failed, cancelled, verified);
+    return key && !failed && !cancelled && verified == plan.chunks.size() &&
+        assemble_depot(depot, manifest, plan, key, folder, pad);
 }
 
-static size_t fetch_manifest(SteamCM& cm, uint32_t appid, uint32_t depot, uint64_t manifest, uint64_t code) {
+static size_t fetch_manifest(SteamCM& cm, uint32_t appid, uint32_t depot, uint64_t manifest, uint64_t code, bool& assembled) {
     PbBuf query{};
     pb_varint(&query, 2, 20);
     uint8_t* response = nullptr;
@@ -197,7 +202,7 @@ static size_t fetch_manifest(SteamCM& cm, uint32_t appid, uint32_t depot, uint64
                 log_printf("Depot %u validated manifest: files=%zu chunks=%zu bytes=%llu encrypted_names=%d\n", depot, plan.files, plan.chunks.size(), static_cast<unsigned long long>(plan.bytes), plan.encrypted_names);
                 uint8_t key[32]{};
                 const bool has_key = cm_depot_key(&cm, appid, depot, key);
-                download_depot_chunks(host, depot, plan, has_key ? key : nullptr);
+                assembled = download_depot_chunks(host, depot, manifest, plan, has_key ? key : nullptr);
                 for (size_t i = 0; i < sizeof(key); ++i)
                     static_cast<volatile uint8_t*>(key)[i] = 0;
             } else {
@@ -278,7 +283,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
             } else {
                 std::puts("Could not load Steam library. See logs/steam-auth.log.");
             }
-            std::printf("\nUp/Down Select | Left/Right Page | A Download encrypted depot cache | B Back\n%s\n", status);
+            std::printf("\nUp/Down Select | Left/Right Page | A Download and assemble depot | B Back\n%s\n", status);
             consoleUpdate(nullptr);
             redraw = false;
         }
@@ -310,6 +315,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                     const uint32_t appid = appids[selected];
                     log_public_manifests(appid, metadata, bytes, depot, manifest);
                     size_t saved = 0;
+                    bool assembled = false;
                     if (depot && manifest) {
                         PbBuf request{};
                         pb_varint(&request, 1, appid);
@@ -327,9 +333,10 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                                    appid, depot, authorized ? "received" : "unavailable", result);
                         std::free(reply);
                         pb_free(&request);
-                        if (authorized) saved = fetch_manifest(cm, appid, depot, manifest, code);
+                        if (authorized) saved = fetch_manifest(cm, appid, depot, manifest, code, assembled);
                     }
-                    std::snprintf(status, sizeof(status), "App %u: manifest %zu bytes. Cache details in log; installation pending", appids[selected], saved);
+                    std::snprintf(status, sizeof(status), "App %u: manifest %zu bytes. %s", appids[selected], saved,
+                                  assembled ? "Depot assembled on SD" : "Depot incomplete (see Steam log)");
                 }
                 else
                     std::snprintf(status, sizeof(status), "App %u: metadata unavailable", appids[selected]);

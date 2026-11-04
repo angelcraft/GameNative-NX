@@ -62,6 +62,18 @@ bool read_depot_manifest(const void* zip, size_t length, uint32_t depot, uint64_
                 uint64_t file_size=0; pb_get_u64(f.data,f.len,2,&file_size);
                 if (UINT64_MAX-plan.bytes < file_size) return false;
                 plan.bytes += file_size;
+                DepotFile file;
+                file.size = file_size;
+                const uint8_t* value = nullptr;
+                size_t value_size = 0;
+                if (!pb_get_bytes(f.data,f.len,1,&value,&value_size) || !value_size) return false;
+                file.name.assign(reinterpret_cast<const char*>(value), value_size);
+                pb_get_u64(f.data,f.len,3,&file.flags);
+                file.link = pb_get_bytes(f.data,f.len,7,&value,&value_size) && value_size;
+                if (pb_get_bytes(f.data,f.len,5,&value,&value_size) && value_size == file.hash.size()) {
+                    std::memcpy(file.hash.data(), value, value_size);
+                    file.has_hash = true;
+                }
                 PbReader fields; PbField c; pb_reader(&fields,f.data,f.len);
                 while (fields.pos < fields.len) {
                     if (!pb_next(&fields,&c)) return false;
@@ -78,7 +90,11 @@ bool read_depot_manifest(const void* zip, size_t length, uint32_t depot, uint64_
                     const auto existing=chunks.find(hex);
                     if (existing != chunks.end() && (existing->second.compressed != compressed || existing->second.original != original || existing->second.adler != adler)) return false;
                     chunks[hex]=chunk;
+                    uint64_t offset = 0;
+                    pb_get_u64(c.data,c.len,3,&offset);
+                    file.parts.push_back({chunk,offset});
                 }
+                plan.mappings.push_back(std::move(file));
             }
         } else if (magic != 0x1b81b817) return false;
     }

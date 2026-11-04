@@ -13,21 +13,15 @@ static bool valid_chunk(const DepotChunk& chunk, const std::vector<uint8_t>& byt
         adler32(0, bytes.data(), bytes.size()) == chunk.adler;
 }
 
-// Port of GameNative gn-download's depot_chunk.rs to libnx and Switch portlibs.
-bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
-                        const void* encrypted, size_t size, std::vector<uint8_t>& output) {
-    const auto fail = [&](const char* stage) {
-        log_printf("Steam chunk %s failed: %s (encrypted=%zu expected=%u)\n",
-                   chunk.sha.c_str(), stage, size, chunk.original);
-        return false;
-    };
-    if (size < 32 || size % 16 || chunk.original > 4*1024*1024) return fail("envelope size");
+bool decrypt_depot_bytes(const uint8_t key[32], const void* encrypted, size_t size,
+                         std::vector<uint8_t>& plain) {
+    if (size < 32 || size % 16 || size > 4*1024*1024) return false;
     const auto* input = static_cast<const uint8_t*>(encrypted);
     Aes256Context aes;
     aes256ContextCreate(&aes, key, false);
     uint8_t iv[16];
     aes256DecryptBlock(&aes, iv, input);
-    std::vector<uint8_t> plain(size - 16);
+    plain.resize(size - 16);
     for (size_t offset = 16; offset < size; offset += 16) {
         auto* block = plain.data() + offset - 16;
         aes256DecryptBlock(&aes, block, input + offset);
@@ -37,10 +31,24 @@ bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
     for (size_t i = 0; i < sizeof(aes); ++i)
         reinterpret_cast<volatile uint8_t*>(&aes)[i] = 0;
     const size_t padding = plain.back();
-    if (!padding || padding > 16) return fail("AES padding");
+    if (!padding || padding > 16) return false;
     for (size_t i = 0; i < padding; ++i)
-        if (plain[plain.size()-1-i] != padding) return fail("AES padding bytes");
+        if (plain[plain.size()-1-i] != padding) return false;
     plain.resize(plain.size()-padding);
+    return true;
+}
+
+// Port of GameNative gn-download's depot_chunk.rs to libnx and Switch portlibs.
+bool decode_depot_chunk(const DepotChunk& chunk, const uint8_t key[32],
+                        const void* encrypted, size_t size, std::vector<uint8_t>& output) {
+    const auto fail = [&](const char* stage) {
+        log_printf("Steam chunk %s failed: %s (encrypted=%zu expected=%u)\n",
+                   chunk.sha.c_str(), stage, size, chunk.original);
+        return false;
+    };
+    std::vector<uint8_t> plain;
+    if (chunk.original > 4*1024*1024 || !decrypt_depot_bytes(key, encrypted, size, plain))
+        return fail("AES envelope");
     const auto* data = plain.data();
     const size_t length = plain.size();
 
