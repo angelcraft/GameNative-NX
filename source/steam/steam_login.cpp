@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include "depot_manifest.h"
 
 extern "C" {
 #include "steam_auth.h"
@@ -79,6 +80,45 @@ static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t s
     return count;
 }
 
+// Ciphertext cache is deliberately separate from installed game files.
+static void download_depot_chunks(const std::string& host, uint32_t depot, const DepotPlan& plan) {
+    const std::string root = "sdmc:/switch/gamenative_nx/chunks";
+    mkdir(root.c_str(), 0777);
+    const std::string folder = root + "/" + std::to_string(depot);
+    mkdir(folder.c_str(), 0777);
+    PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
+    size_t downloaded = 0, cached = 0, failed = 0;
+    bool cancelled = false;
+    for (size_t i = 0; i < plan.chunks.size(); ++i) {
+        padUpdate(&pad);
+        if (!appletMainLoop() || (padGetButtonsDown(&pad) & HidNpadButton_B)) { cancelled = true; break; }
+        const auto& chunk = plan.chunks[i];
+        const std::string path = folder + "/" + chunk.sha + ".encrypted";
+        struct stat info{};
+        if (stat(path.c_str(), &info) == 0 && static_cast<uint64_t>(info.st_size) == chunk.compressed) { ++cached; continue; }
+        consoleClear();
+        std::printf("Downloading Steam depot %u\n%zu files | %zu unique chunks\nChunk %zu/%zu | cached %zu | downloaded %zu\nB Cancel (after current request)\n\nEncrypted cache only; game is not installed yet.\n", depot, plan.files, plan.chunks.size(), i+1, plan.chunks.size(), cached, downloaded);
+        consoleUpdate(nullptr);
+        const std::string url = "https://" + host + "/depot/" + std::to_string(depot) + "/chunk/" + chunk.sha;
+        NetResponse response{};
+        bool saved = false;
+        if (net_get(url.c_str(), &response) && response.status == 200 && response.len == chunk.compressed) {
+            const std::string temporary = path + ".tmp";
+            if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
+                const bool written = std::fwrite(response.body, 1, response.len, file) == response.len;
+                const bool closed = std::fclose(file) == 0;
+                saved = written && closed && std::rename(temporary.c_str(), path.c_str()) == 0;
+                if (!saved) std::remove(temporary.c_str());
+            }
+        }
+        if (saved) ++downloaded; else ++failed;
+        log_printf("Depot %u chunk %zu/%zu HTTP %ld bytes %zu/%u cached=%d (ciphertext, not verified)\n", depot, i+1, plan.chunks.size(), response.status, response.len, chunk.compressed, saved);
+        net_response_free(&response);
+        if (failed) break; // Retrying A resumes completed cache entries.
+    }
+    log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d; decryption pending\n", depot, downloaded, cached, failed, cancelled);
+}
+
 static size_t fetch_manifest(SteamCM& cm, uint32_t depot, uint64_t manifest, uint64_t code) {
     PbBuf query{};
     pb_varint(&query, 2, 20);
@@ -124,6 +164,15 @@ static size_t fetch_manifest(SteamCM& cm, uint32_t depot, uint64_t manifest, uin
                     saved = download.len;
                 else
                     std::remove(temporary.c_str());
+            }
+        }
+        if (saved) {
+            DepotPlan plan;
+            if (read_depot_manifest(download.body, download.len, depot, manifest, plan)) {
+                log_printf("Depot %u validated manifest: files=%zu chunks=%zu bytes=%llu encrypted_names=%d\n", depot, plan.files, plan.chunks.size(), static_cast<unsigned long long>(plan.bytes), plan.encrypted_names);
+                download_depot_chunks(host, depot, plan);
+            } else {
+                log_printf("Depot %u manifest validation failed; no chunks requested\n", depot);
             }
         }
         log_printf("Depot %u manifest CDN HTTP %ld, saved %zu bytes\n", depot, download.status, saved);
@@ -200,7 +249,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
             } else {
                 std::puts("Could not load Steam library. See logs/steam-auth.log.");
             }
-            std::printf("\nUp/Down Select | Left/Right Page | A Check product info | B Back\n%s\n", status);
+            std::printf("\nUp/Down Select | Left/Right Page | A Download encrypted depot cache | B Back\n%s\n", status);
             consoleUpdate(nullptr);
             redraw = false;
         }
@@ -230,7 +279,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                     uint32_t depot = 0;
                     uint64_t manifest = 0;
                     const uint32_t appid = appids[selected];
-                    const size_t manifests = log_public_manifests(appid, metadata, bytes, depot, manifest);
+                    log_public_manifests(appid, metadata, bytes, depot, manifest);
                     size_t saved = 0;
                     if (depot && manifest) {
                         PbBuf request{};
@@ -251,7 +300,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                         pb_free(&request);
                         if (authorized) saved = fetch_manifest(cm, depot, manifest, code);
                     }
-                    std::snprintf(status, sizeof(status), "App %u: %zu public depot manifests, %zu bytes saved", appids[selected], manifests, saved);
+                    std::snprintf(status, sizeof(status), "App %u: manifest %zu bytes. Cache details in log; installation pending", appids[selected], saved);
                 }
                 else
                     std::snprintf(status, sizeof(status), "App %u: metadata unavailable", appids[selected]);

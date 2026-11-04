@@ -34,9 +34,9 @@ void net_exit(void)
 static size_t on_body(char *data, size_t size, size_t nmemb, void *user)
 {
     NetResponse *resp = user;
-    if (size && nmemb > (1024 * 1024) / size) return 0;
+    if (size && nmemb > (4 * 1024 * 1024) / size) return 0;
     size_t n = size * nmemb;
-    if (n > 1024 * 1024 - resp->len) return 0;
+    if (n > 4 * 1024 * 1024 - resp->len) return 0;
     char *grown = realloc(resp->body, resp->len + n + 1);
     if (!grown)
         return 0;

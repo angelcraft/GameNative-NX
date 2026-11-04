@@ -134,7 +134,7 @@ bool pb_next(PbReader *r, PbField *f)
         return read_fixed(r, 4, &f->value);
     case PB_BYTES: {
         uint64_t len;
-        if (!read_varint(r, &len) || r->pos + len > r->len)
+        if (!read_varint(r, &len) || len > r->len - r->pos)
             return false;
         f->data = r->data + r->pos;
         f->len = len;
