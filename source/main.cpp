@@ -15,7 +15,6 @@
 #include <cerrno>
 #include <vector>
 #include <algorithm>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -194,7 +193,9 @@ static void* gn_vortek_probe_mmap(void* addr, size_t length, int prot, int flags
                                   int fd, int64_t offset) {
     vortek_trace("mmap enter length=%zu fd=%d flags=%#x", length, fd, flags);
     void* result = gn_android_mmap(addr, length, prot, flags, fd, offset);
-    vortek_trace("mmap return addr=%p errno=%d", result, result == MAP_FAILED ? errno : 0);
+    // The Android shim returns (void*)-1 on failure. devkitA64 has no sys/mman.h.
+    const bool failed = result == reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+    vortek_trace("mmap return addr=%p errno=%d", result, failed ? errno : 0);
     return result;
 }
 
