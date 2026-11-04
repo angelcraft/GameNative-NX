@@ -329,7 +329,7 @@ int cm_call(SteamCM *cm, const char *method, const PbBuf *body, uint8_t **resp, 
     return eresult;
 }
 
-bool cm_app_info_size(SteamCM *cm, uint32_t appid, size_t *size)
+bool cm_app_info(SteamCM *cm, uint32_t appid, uint8_t **data, size_t *size)
 {
     // Steam PICS product info, one app per request.
     PbBuf app = {0}, request = {0};
@@ -356,7 +356,8 @@ bool cm_app_info_size(SteamCM *cm, uint32_t appid, size_t *size)
             if (field.field == 1 && field.wire == PB_BYTES &&
                 pb_get_u64(field.data, field.len, 1, &returned_id) && returned_id == appid &&
                 pb_get_bytes(field.data, field.len, 5, &metadata, size) && *size > 0) {
-                ok = true;
+                *data = dup_bytes(metadata, *size);
+                ok = *data != NULL;
                 break;
             }
         }

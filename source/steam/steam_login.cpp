@@ -25,6 +25,51 @@ extern "C" void log_printf(const char* format, ...) {
     std::fclose(file);
 }
 
+// PICS app buffers contain text KeyValues. Only inspect depots/<id>/manifests/public.
+static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t size) {
+    std::vector<std::string> path;
+    std::string key;
+    bool have_key = false;
+    size_t count = 0;
+    for (size_t i = 0; i < size && data[i];) {
+        const char ch = static_cast<char>(data[i++]);
+        if (ch == '/' && i < size && data[i] == '/') {
+            while (i < size && data[i] != '\n') ++i;
+        } else if (ch == '{' && have_key) {
+            if (path.size() == 32) break;
+            path.push_back(key);
+            have_key = false;
+        } else if (ch == '}' && !path.empty()) {
+            path.pop_back();
+            have_key = false;
+        } else if (ch == '"') {
+            std::string value;
+            while (i < size && data[i] && data[i] != '"') {
+                if (data[i] == '\\' && i + 1 < size) ++i;
+                value += static_cast<char>(data[i++]);
+            }
+            if (i == size || data[i++] != '"') break;
+            if (!have_key) {
+                key = value;
+                have_key = true;
+                continue;
+            }
+            const auto decimal = [](const std::string& text) {
+                return !text.empty() && text.size() <= 20 &&
+                    text.find_first_not_of("0123456789") == std::string::npos;
+            };
+            if (path.size() == 5 && path[0] == "appinfo" && path[1] == "depots" &&
+                decimal(path[2]) && path[3] == "manifests" && path[4] == "public" &&
+                key == "gid" && decimal(value)) {
+                log_printf("App %u depot %s public manifest %s\n", appid, path[2].c_str(), value.c_str());
+                ++count;
+            }
+            have_key = false;
+        }
+    }
+    return count;
+}
+
 static void show_steam_library(PadState& pad, const SteamSession& session) {
     consoleClear();
     std::puts("Connecting to Steam CM...");
@@ -114,13 +159,17 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                 std::puts("Requesting Steam product metadata...");
                 consoleUpdate(nullptr);
                 size_t bytes = 0;
+                uint8_t* metadata = nullptr;
                 const bool ok = cm_connect(&cm) && cm_logon(&cm, &session) &&
-                    cm_app_info_size(&cm, appids[selected], &bytes);
+                    cm_app_info(&cm, appids[selected], &metadata, &bytes);
                 cm_close(&cm);
-                if (ok)
-                    std::snprintf(status, sizeof(status), "App %u: %zu metadata bytes received", appids[selected], bytes);
+                if (ok) {
+                    const size_t manifests = log_public_manifests(appids[selected], metadata, bytes);
+                    std::snprintf(status, sizeof(status), "App %u: %zu public depot manifests", appids[selected], manifests);
+                }
                 else
                     std::snprintf(status, sizeof(status), "App %u: metadata unavailable", appids[selected]);
+                std::free(metadata);
                 log_printf("%s\n", status);
                 redraw = true;
             }

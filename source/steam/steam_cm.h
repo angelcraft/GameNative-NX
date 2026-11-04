@@ -28,4 +28,4 @@ void cm_close(SteamCM *cm);
 // Retourne l'eresult Steam (1 = OK) ou CM_TRANSPORT_ERROR. Si OK, *resp est alloué (à libérer).
 int cm_call(SteamCM *cm, const char *method, const PbBuf *body, uint8_t **resp, size_t *resp_len);
 
-bool cm_app_info_size(SteamCM *cm, uint32_t appid, size_t *size);
+bool cm_app_info(SteamCM *cm, uint32_t appid, uint8_t **data, size_t *size);

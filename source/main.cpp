@@ -3859,6 +3859,21 @@ void runtime_probe_leaf_module(std::string& result) {
     vortek_trace("TPIDR_EL0=%016llx", static_cast<unsigned long long>(thread_pointer));
     for (unsigned i = 0; i < 16; ++i)
         vortek_trace("createVkContext+0x%02x instruction=%08x", i * 4, entry_words[i]);
+    // This prologue reads Bionic's stack guard from TPIDR_EL0 + 0x28.
+    // Check Horizon's memory map before executing the known incompatible load.
+    if (entry_words[8] == 0xd53bd05c && entry_words[9] == 0xf9401788) {
+        const u64 guard_address = thread_pointer + 0x28;
+        MemoryInfo info{};
+        u32 page_info = 0;
+        const Result rc = svcQueryMemory(&info, &page_info, guard_address);
+        if (R_FAILED(rc) || !(info.perm & Perm_R) ||
+            guard_address - info.addr > info.size ||
+            info.size - (guard_address - info.addr) < sizeof(u64)) {
+            result = "V35 stopped before execution: Android stack guard is outside readable TLS";
+            vortek_trace("%s", result.c_str());
+            return;
+        }
+    }
     vortek_trace("enter native createVkContext");
 
     const int fault_fd = ::open(kLog, O_WRONLY | O_APPEND);
