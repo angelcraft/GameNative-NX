@@ -26,7 +26,8 @@ extern "C" void log_printf(const char* format, ...) {
 }
 
 // PICS app buffers contain text KeyValues. Only inspect depots/<id>/manifests/public.
-static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t size) {
+static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t size,
+                                   uint32_t& depot, uint64_t& manifest) {
     std::vector<std::string> path;
     std::string key;
     bool have_key = false;
@@ -62,6 +63,13 @@ static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t s
                 decimal(path[2]) && path[3] == "manifests" && path[4] == "public" &&
                 key == "gid" && decimal(value)) {
                 log_printf("App %u depot %s public manifest %s\n", appid, path[2].c_str(), value.c_str());
+                if (!depot) {
+                    const auto id = std::strtoull(path[2].c_str(), nullptr, 10);
+                    if (id <= UINT32_MAX) {
+                        depot = static_cast<uint32_t>(id);
+                        manifest = std::strtoull(value.c_str(), nullptr, 10);
+                    }
+                }
                 ++count;
             }
             have_key = false;
@@ -162,13 +170,34 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                 uint8_t* metadata = nullptr;
                 const bool ok = cm_connect(&cm) && cm_logon(&cm, &session) &&
                     cm_app_info(&cm, appids[selected], &metadata, &bytes);
-                cm_close(&cm);
                 if (ok) {
-                    const size_t manifests = log_public_manifests(appids[selected], metadata, bytes);
+                    uint32_t depot = 0;
+                    uint64_t manifest = 0;
+                    const uint32_t appid = appids[selected];
+                    const size_t manifests = log_public_manifests(appid, metadata, bytes, depot, manifest);
+                    if (depot && manifest) {
+                        PbBuf request{};
+                        pb_varint(&request, 1, appid);
+                        pb_varint(&request, 2, depot);
+                        pb_varint(&request, 3, manifest);
+                        pb_string(&request, 4, "public");
+                        uint8_t* reply = nullptr;
+                        size_t length = 0;
+                        const int result = request.error ? CM_TRANSPORT_ERROR :
+                            cm_call(&cm, "ContentServerDirectory.GetManifestRequestCode#1",
+                                    &request, &reply, &length);
+                        uint64_t code = 0;
+                        const bool authorized = result == 1 && pb_get_u64(reply, length, 1, &code) && code;
+                        log_printf("App %u depot %u manifest request code %s (result %d)\n",
+                                   appid, depot, authorized ? "received" : "unavailable", result);
+                        std::free(reply);
+                        pb_free(&request);
+                    }
                     std::snprintf(status, sizeof(status), "App %u: %zu public depot manifests", appids[selected], manifests);
                 }
                 else
                     std::snprintf(status, sizeof(status), "App %u: metadata unavailable", appids[selected]);
+                cm_close(&cm);
                 std::free(metadata);
                 log_printf("%s\n", status);
                 redraw = true;
