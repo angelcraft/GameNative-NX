@@ -1,6 +1,7 @@
 #include <switch.h>
 #include <solder.h>
 #include "android_compat.hpp"
+#include "game_library.hpp"
 
 #include <cstdarg>
 #include <cstdio>
@@ -4085,7 +4086,8 @@ int main(int /*argc*/, char** /*argv*/) {
         );
 
         std::printf(
-            "A = Run runtime probe\n"
+            "A = Steam library\n"
+            "X = Run V35 runtime probe\n"
             "+ = Exit\n\n"
         );
 
@@ -4107,7 +4109,9 @@ int main(int /*argc*/, char** /*argv*/) {
         if ((buttons & HidNpadButton_Plus) != 0)
             break;
 
-        if ((buttons & HidNpadButton_A) != 0 &&
+        if (buttons & HidNpadButton_A)
+            run_game_library(pad, kRoot);
+        if ((buttons & HidNpadButton_X) != 0 &&
             solder_ok &&
             !audited) {
 
