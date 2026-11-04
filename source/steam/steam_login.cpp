@@ -81,13 +81,13 @@ static size_t log_public_manifests(uint32_t appid, const uint8_t* data, size_t s
 }
 
 // Ciphertext cache is deliberately separate from installed game files.
-static void download_depot_chunks(const std::string& host, uint32_t depot, const DepotPlan& plan) {
+static void download_depot_chunks(const std::string& host, uint32_t depot, const DepotPlan& plan, const uint8_t* key) {
     const std::string root = "sdmc:/switch/gamenative_nx/chunks";
     mkdir(root.c_str(), 0777);
     const std::string folder = root + "/" + std::to_string(depot);
     mkdir(folder.c_str(), 0777);
     PadState pad; padConfigureInput(1, HidNpadStyleSet_NpadStandard); padInitializeDefault(&pad);
-    size_t downloaded = 0, cached = 0, failed = 0;
+    size_t downloaded = 0, cached = 0, failed = 0, verified = 0;
     bool cancelled = false;
     for (size_t i = 0; i < plan.chunks.size(); ++i) {
         padUpdate(&pad);
@@ -95,14 +95,36 @@ static void download_depot_chunks(const std::string& host, uint32_t depot, const
         const auto& chunk = plan.chunks[i];
         const std::string path = folder + "/" + chunk.sha + ".encrypted";
         struct stat info{};
-        if (stat(path.c_str(), &info) == 0 && static_cast<uint64_t>(info.st_size) == chunk.compressed) { ++cached; continue; }
+        const bool existing = stat(path.c_str(), &info) == 0 &&
+            static_cast<uint64_t>(info.st_size) == chunk.compressed;
+        if (existing && !key) { ++cached; continue; }
+        std::vector<uint8_t> ciphertext, decoded;
+        if (existing && key && chunk.compressed <= 4*1024*1024) {
+            if (FILE* file = std::fopen(path.c_str(), "rb")) {
+                ciphertext.resize(chunk.compressed);
+                const bool read = std::fread(ciphertext.data(), 1, ciphertext.size(), file) == ciphertext.size();
+                std::fclose(file);
+                if (read && decode_depot_chunk(chunk, key, ciphertext.data(), ciphertext.size(), decoded)) {
+                    ++cached;
+                    ++verified;
+                    continue;
+                }
+            }
+        }
         consoleClear();
-        std::printf("Downloading Steam depot %u\n%zu files | %zu unique chunks\nChunk %zu/%zu | cached %zu | downloaded %zu\nB Cancel (after current request)\n\nEncrypted cache only; game is not installed yet.\n", depot, plan.files, plan.chunks.size(), i+1, plan.chunks.size(), cached, downloaded);
+        std::printf("Downloading Steam depot %u\n%zu files | %zu unique chunks\nChunk %zu/%zu | cached %zu | downloaded %zu\nB Cancel (after current request)\n\nCaching Steam content; installation pending.\n", depot, plan.files, plan.chunks.size(), i+1, plan.chunks.size(), cached, downloaded);
         consoleUpdate(nullptr);
         const std::string url = "https://" + host + "/depot/" + std::to_string(depot) + "/chunk/" + chunk.sha;
         NetResponse response{};
         bool saved = false;
         if (net_get(url.c_str(), &response) && response.status == 200 && response.len == chunk.compressed) {
+            if (key && !decode_depot_chunk(chunk, key, response.body, response.len, decoded)) {
+                log_printf("Depot %u chunk %zu: decrypt/decompress/integrity validation failed\n", depot, i+1);
+                net_response_free(&response);
+                ++failed;
+                break;
+            }
+            if (key) ++verified;
             const std::string temporary = path + ".tmp";
             if (FILE* file = std::fopen(temporary.c_str(), "wb")) {
                 const bool written = std::fwrite(response.body, 1, response.len, file) == response.len;
@@ -112,14 +134,14 @@ static void download_depot_chunks(const std::string& host, uint32_t depot, const
             }
         }
         if (saved) ++downloaded; else ++failed;
-        log_printf("Depot %u chunk %zu/%zu HTTP %ld bytes %zu/%u cached=%d (ciphertext, not verified)\n", depot, i+1, plan.chunks.size(), response.status, response.len, chunk.compressed, saved);
+        log_printf("Depot %u chunk %zu/%zu HTTP %ld bytes %zu/%u saved=%d\n", depot, i+1, plan.chunks.size(), response.status, response.len, chunk.compressed, saved);
         net_response_free(&response);
         if (failed) break; // Retrying A resumes completed cache entries.
     }
-    log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d; decryption pending\n", depot, downloaded, cached, failed, cancelled);
+    log_printf("Depot %u cache: downloaded=%zu existing=%zu failed=%zu cancelled=%d verified=%zu\n", depot, downloaded, cached, failed, cancelled, verified);
 }
 
-static size_t fetch_manifest(SteamCM& cm, uint32_t depot, uint64_t manifest, uint64_t code) {
+static size_t fetch_manifest(SteamCM& cm, uint32_t appid, uint32_t depot, uint64_t manifest, uint64_t code) {
     PbBuf query{};
     pb_varint(&query, 2, 20);
     uint8_t* response = nullptr;
@@ -170,7 +192,11 @@ static size_t fetch_manifest(SteamCM& cm, uint32_t depot, uint64_t manifest, uin
             DepotPlan plan;
             if (read_depot_manifest(download.body, download.len, depot, manifest, plan)) {
                 log_printf("Depot %u validated manifest: files=%zu chunks=%zu bytes=%llu encrypted_names=%d\n", depot, plan.files, plan.chunks.size(), static_cast<unsigned long long>(plan.bytes), plan.encrypted_names);
-                download_depot_chunks(host, depot, plan);
+                uint8_t key[32]{};
+                const bool has_key = cm_depot_key(&cm, appid, depot, key);
+                download_depot_chunks(host, depot, plan, has_key ? key : nullptr);
+                for (size_t i = 0; i < sizeof(key); ++i)
+                    static_cast<volatile uint8_t*>(key)[i] = 0;
             } else {
                 log_printf("Depot %u manifest validation failed; no chunks requested\n", depot);
             }
@@ -298,7 +324,7 @@ static void show_steam_library(PadState& pad, const SteamSession& session) {
                                    appid, depot, authorized ? "received" : "unavailable", result);
                         std::free(reply);
                         pb_free(&request);
-                        if (authorized) saved = fetch_manifest(cm, depot, manifest, code);
+                        if (authorized) saved = fetch_manifest(cm, appid, depot, manifest, code);
                     }
                     std::snprintf(status, sizeof(status), "App %u: manifest %zu bytes. Cache details in log; installation pending", appids[selected], saved);
                 }

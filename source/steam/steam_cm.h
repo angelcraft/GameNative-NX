@@ -29,3 +29,4 @@ void cm_close(SteamCM *cm);
 int cm_call(SteamCM *cm, const char *method, const PbBuf *body, uint8_t **resp, size_t *resp_len);
 
 bool cm_app_info(SteamCM *cm, uint32_t appid, uint8_t **data, size_t *size);
+bool cm_depot_key(SteamCM *cm, uint32_t appid, uint32_t depot, uint8_t key[32]);

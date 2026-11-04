@@ -7,14 +7,13 @@ extern "C" {
 }
 static uint32_t le32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1])<<8 | uint32_t(p[2])<<16 | uint32_t(p[3])<<24; }
 static unsigned le16(const uint8_t* p) { return p[0] | unsigned(p[1])<<8; }
-bool read_depot_manifest(const void* zip, size_t length, uint32_t depot, uint64_t manifest, DepotPlan& out) {
-    out = {};
+bool inflate_depot_zip(const void* zip, size_t length, size_t limit, std::vector<uint8_t>& data) {
     const auto* z = static_cast<const uint8_t*>(zip);
     if (length < 30 || le32(z) != 0x04034b50 || le16(z+6) != 0 || le16(z+8) != 8) return false;
     const size_t start = 30 + le16(z+26) + le16(z+28);
     const uint32_t packed = le32(z+18), unpacked = le32(z+22);
-    if (start > length || packed > length-start || !unpacked || unpacked > 16*1024*1024) return false;
-    std::vector<uint8_t> data(unpacked);
+    if (start > length || packed > length-start || !unpacked || unpacked > limit) return false;
+    data.resize(unpacked);
     z_stream stream{};
     stream.next_in = const_cast<Bytef*>(z+start); stream.avail_in = packed;
     stream.next_out = data.data(); stream.avail_out = unpacked;
@@ -22,7 +21,12 @@ bool read_depot_manifest(const void* zip, size_t length, uint32_t depot, uint64_
     const int result = inflate(&stream, Z_FINISH);
     const bool inflated = result == Z_STREAM_END && stream.total_out == unpacked && stream.total_in == packed;
     inflateEnd(&stream);
-    if (!inflated || crc32(0, data.data(), unpacked) != le32(z+14)) return false;
+    return inflated && crc32(0, data.data(), unpacked) == le32(z+14);
+}
+bool read_depot_manifest(const void* zip, size_t length, uint32_t depot, uint64_t manifest, DepotPlan& out) {
+    out = {};
+    std::vector<uint8_t> data;
+    if (!inflate_depot_zip(zip, length, 16*1024*1024, data)) return false;
     DepotPlan plan;
     bool payload = false, metadata = false, end = false;
     std::map<std::string, DepotChunk> chunks;
@@ -55,15 +59,17 @@ bool read_depot_manifest(const void* zip, size_t length, uint32_t depot, uint64_
                 while (fields.pos < fields.len) {
                     if (!pb_next(&fields,&c)) return false;
                     if (c.field != 6 || c.wire != PB_BYTES) continue;
-                    const uint8_t* sha=nullptr; size_t sha_size=0; uint64_t compressed=0,original=0;
+                    const uint8_t* sha=nullptr; size_t sha_size=0; uint64_t compressed=0,original=0,adler=0;
+                    pb_get_u64(c.data,c.len,2,&adler);
+                    if (adler > UINT32_MAX) return false;
                     if (!pb_get_bytes(c.data,c.len,1,&sha,&sha_size) || sha_size != 20 ||
                         !pb_get_u64(c.data,c.len,4,&original) || !original || original > UINT32_MAX ||
                         !pb_get_u64(c.data,c.len,5,&compressed) || !compressed || compressed > UINT32_MAX) return false;
                     std::string hex; constexpr char digits[]="0123456789abcdef";
                     for (size_t i=0;i<20;++i) { hex += digits[sha[i]>>4]; hex += digits[sha[i]&15]; }
-                    const DepotChunk chunk{hex,static_cast<uint32_t>(compressed),static_cast<uint32_t>(original)};
+                    const DepotChunk chunk{hex,static_cast<uint32_t>(compressed),static_cast<uint32_t>(original),static_cast<uint32_t>(adler)};
                     const auto existing=chunks.find(hex);
-                    if (existing != chunks.end() && (existing->second.compressed != compressed || existing->second.original != original)) return false;
+                    if (existing != chunks.end() && (existing->second.compressed != compressed || existing->second.original != original || existing->second.adler != adler)) return false;
                     chunks[hex]=chunk;
                 }
             }

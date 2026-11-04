@@ -365,3 +365,29 @@ bool cm_app_info(SteamCM *cm, uint32_t appid, uint8_t **data, size_t *size)
     wait_free(&response);
     return ok;
 }
+bool cm_depot_key(SteamCM *cm, uint32_t appid, uint32_t depot, uint8_t key[32])
+{
+    PbBuf request = {0};
+    pb_varint(&request, 1, depot);
+    pb_varint(&request, 2, appid);
+    uint64_t job = cm->next_job++;
+    keepalive(cm);
+    bool sent = !request.error && cm_send(cm, 5438, &request, job, NULL);
+    pb_free(&request);
+    if (!sent) return false;
+
+    CmWait reply = {.emsg = 5439, .job = job};
+    uint64_t result = 0, returned_depot = 0;
+    const uint8_t *bytes;
+    size_t length;
+    bool ok = cm_wait(cm, &reply) &&
+        pb_get_u64(reply.body, reply.body_len, 1, &result) && result == 1 &&
+        pb_get_u64(reply.body, reply.body_len, 2, &returned_depot) && returned_depot == depot &&
+        pb_get_bytes(reply.body, reply.body_len, 3, &bytes, &length) && length == 32;
+    if (ok) memcpy(key, bytes, 32);
+    for (size_t i = 0; i < reply.body_len && reply.body; ++i)
+        ((volatile uint8_t *)reply.body)[i] = 0;
+    wait_free(&reply);
+    log_printf("Depot %u key request result %llu\n", depot, (unsigned long long)result);
+    return ok;
+}
